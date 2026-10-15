@@ -44,6 +44,7 @@ const formBody = (query: string): string => new URLSearchParams({ data: query })
 describe('server endpoints', () => {
   let app: FastifyInstance;
   let dataDir: string;
+  let engine: AmenityEngine;
 
   beforeAll(async () => {
     dataDir = mkdtempSync(path.join(tmpdir(), 'oam-server-'));
@@ -56,19 +57,23 @@ describe('server endpoints', () => {
     );
     await fsPromises.writeFile(
       path.join(dataDir, 'manifest.json'),
-      JSON.stringify({ totalElements: 2 })
+      JSON.stringify({ totalElements: 2, configHash: configHash.toString('hex'), shards: [CELL] })
     );
     await fsPromises.writeFile(
       path.join(dataDir, 'state.json'),
       JSON.stringify({
         lastSeq: 7327518,
         lastUpdate: '2026-10-14T09:00:00Z',
-        dataTimestamp: '2026-10-14T08:59:00Z'
+        dataTimestamp: '2026-10-14T08:59:00Z',
+        replication: {
+          baseUrl: 'https://planet.openstreetmap.org/replication',
+          kind: 'planet', interval: 'minute', sequenceNumber: 7327518
+        }
       })
     );
 
     const config = loadConfig({ OSM_AMENITY_DATA_DIR: dataDir, OSM_AMENITY_AMENITIES: 'toilets' });
-    const engine = new AmenityEngine(
+    engine = new AmenityEngine(
       { dataDir, shardPrecision: 5, cacheMb: 1, generator: 'osm-amenity-overpass-server' },
       buildLogger('errors')
     );
@@ -92,9 +97,18 @@ describe('server endpoints', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toContain('application/json');
     expect(typeof res.headers.etag).toBe('string');
-    const body = res.body as { version: number; elements: Array<{ id: number }> };
+    const body = res.body as { version: number; elements: Array<Record<string, unknown> & { id: number }> };
     expect(body.version).toBe(0.6);
     expect(body.elements.map((e) => e.id)).toEqual([100]);
+    expect(body.elements[0]).toMatchObject({ version: 2, timestamp: '2025-10-09T08:53:20Z', changeset: 1 });
+    expect(body.elements[0]).not.toHaveProperty('meta');
+  });
+
+  it('reads GET data parameters and limits results to requested types', async () => {
+    const query = '[out:json]node["amenity"="toilets"](35.04,135.04,35.07,135.07);out;';
+    const res = await request(app.server).get('/api/interpreter').query({ data: query });
+    expect(res.status).toBe(200);
+    expect(res.body.elements.map((e: { type: string }) => e.type)).toEqual(['node']);
   });
 
   it('answers out-of-scope queries with 501', async () => {
@@ -103,6 +117,20 @@ describe('server endpoints', () => {
       .send(formBody('node["amenity"="parking"](35.04,135.04,35.07,135.07);out;'));
     expect(res.status).toBe(501);
     expect(res.body).toEqual({ error: 'out of scope' });
+  });
+
+  it('returns internal error when a requested shard is corrupt', async () => {
+    const fs = await import('node:fs/promises');
+    const file = path.join(dataDir, 'shards', `${CELL}.bin`);
+    const good = await fs.readFile(file);
+    const bad = Buffer.from(good); bad[bad.length - 1] ^= 0xff;
+    await fs.writeFile(file, bad);
+    engine.invalidateCells([CELL]);
+    const res = await request(app.server).post('/api/interpreter').send(formBody(TILE_QUERY));
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'internal error' });
+    await fs.writeFile(file, good);
+    engine.invalidateCells([CELL]);
   });
 
   it('answers non-amenity queries with 501', async () => {
@@ -131,6 +159,7 @@ describe('server endpoints', () => {
     expect(body.localEngine.shards).toBe(1);
     expect(body.localEngine.elements).toBe(2);
     expect(body.localEngine.updateIntervalSeconds).toBe(3600);
+    expect(body.localEngine.replication).toMatchObject({ kind: 'planet', interval: 'minute', sequenceNumber: 7327518 });
   });
 
   it('reports osm_osm_change 0 without state', async () => {
@@ -151,11 +180,90 @@ describe('server endpoints', () => {
         const body = res.json();
         expect(body.osm_osm_change).toBe('0');
         expect(body.localEngine.lastSeq).toBeNull();
+        const timestamp = await app2.inject({ method: 'GET', url: '/api/timestamp' });
+        expect(timestamp.body).toBe('');
+        const timestampAgain = await app2.inject({ method: 'GET', url: '/api/timestamp' });
+        expect(timestampAgain.body).toBe(timestamp.body);
+        const noIndex = await app2.inject({
+          method: 'POST', url: '/api/interpreter', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          payload: formBody(TILE_QUERY)
+        });
+        expect(noIndex.statusCode).toBe(500);
       } finally {
         await app2.close();
       }
     } finally {
       rmSync(dataDir2, { recursive: true, force: true });
+    }
+  });
+
+  it('serves a valid explicitly empty generation as a successful empty response', async () => {
+    const emptyDir = mkdtempSync(path.join(tmpdir(), 'oam-server-empty-generation-'));
+    try {
+      const hash = buildConfigHash({ amenities: ['toilets'], precision: 5 }).toString('hex');
+      await (await import('node:fs/promises')).writeFile(path.join(emptyDir, 'manifest.json'), JSON.stringify({
+        configHash: hash, shards: [], totalElements: 0
+      }));
+      await (await import('node:fs/promises')).writeFile(path.join(emptyDir, 'state.json'), JSON.stringify({
+        dataTimestamp: '2026-10-15T00:00:00Z'
+      }));
+      const config = loadConfig({ OSM_AMENITY_DATA_DIR: emptyDir });
+      const emptyApp = await buildServer({
+        config,
+        engine: new AmenityEngine({ dataDir: emptyDir, shardPrecision: 5, cacheMb: 1, generator: 'test' }, buildLogger('errors')),
+        stats: new Stats(), logger: buildLogger('errors'), serverVersion: 'test'
+      });
+      try {
+        const response = await emptyApp.inject({
+          method: 'POST', url: '/api/interpreter', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          payload: formBody(TILE_QUERY)
+        });
+        expect(response.statusCode).toBe(200);
+        expect(response.json().elements).toEqual([]);
+      } finally {
+        await emptyApp.close();
+      }
+    } finally {
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps regional daily cursors out of the global Overpass minute field', async () => {
+    const regionalDir = mkdtempSync(path.join(tmpdir(), 'oam-server-regional-'));
+    try {
+      await (await import('node:fs/promises')).writeFile(path.join(regionalDir, 'state.json'), JSON.stringify({
+        lastSeq: 4939, dataTimestamp: '2026-10-14T00:00:00Z',
+        replication: {
+          baseUrl: 'https://download.geofabrik.de/asia/japan-updates',
+          kind: 'regional', interval: 'day', sequenceNumber: 4939, originalMinuteSeq: 7329040
+        }
+      }));
+      const regionalConfig = loadConfig({
+        OSM_AMENITY_DATA_DIR: regionalDir,
+        OSM_AMENITY_UPDATE_BASE_URL: 'https://download.geofabrik.de/asia/japan-updates'
+      });
+      expect(regionalConfig.updateKind).toBe('regional');
+      expect(regionalConfig.updateGranularity).toBe('day');
+      const regionalEngine = new AmenityEngine({
+        dataDir: regionalDir, shardPrecision: 5, cacheMb: 1, generator: 'test'
+      }, buildLogger('errors'));
+      const regionalApp = await buildServer({
+        config: regionalConfig, engine: regionalEngine, stats: new Stats(),
+        logger: buildLogger('errors'), serverVersion: 'test'
+      });
+      try {
+        const response = await regionalApp.inject('/api/status');
+        const body = response.json();
+        expect(body.osm_osm_change).toBe('0');
+        expect(body.localEngine.lastSeq).toBe(4939);
+        expect(body.localEngine.replication).toMatchObject({
+          kind: 'regional', interval: 'day', sequenceNumber: 4939, originalMinuteSeq: 7329040
+        });
+      } finally {
+        await regionalApp.close();
+      }
+    } finally {
+      rmSync(regionalDir, { recursive: true, force: true });
     }
   });
 
@@ -176,5 +284,7 @@ describe('server endpoints', () => {
     expect(res.status).toBe(200);
     const res2 = await request(app.server).head('/api/status');
     expect(res2.status).toBe(200);
+    const interpreterHead = await request(app.server).head('/api/interpreter');
+    expect(interpreterHead.status).toBe(200);
   });
 });

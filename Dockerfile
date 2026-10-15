@@ -1,16 +1,25 @@
-FROM node:20-alpine AS builder
+FROM node:22-bookworm-slim AS builder
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install --omit=optional
-COPY . .
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src ./src
+COPY tsconfig.json ./tsconfig.json
 RUN npm run build
 
-FROM node:20-alpine AS runner
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-COPY package.json package-lock.json* ./
-RUN npm install --omit=dev --omit=optional
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends osmium-tool coreutils util-linux gawk ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
-# Data directory (shards, indexes, manifest, state.json) is mounted read-only at runtime;
-# the optional write path for self-updates is /app/data-writable.
+COPY scripts ./scripts
+
+# The active generation is /osm/data; updater staging and immutable generations
+# are siblings under the same writable pipeline root (/osm).
+VOLUME ["/osm"]
+ENV OSM_AMENITY_DATA_DIR=/osm/data
+EXPOSE 8081
 CMD ["node", "dist/index.js"]

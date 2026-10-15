@@ -62,6 +62,10 @@ describe('parseAmenityQuery', () => {
     expect(parseAmenityQuery('node["amenity"="toilets"];out;')).toBeNull();
   });
 
+  it('rejects bbox text with extra unparsed characters', () => {
+    expect(parseAmenityQuery('node["amenity"="toilets"](x1,1,1.1,1.1z);out;')).toBeNull();
+  });
+
   it('rejects multiple different amenity values', () => {
     const q = parseAmenityQuery(
       'node["amenity"="toilets"](1.0,1.0,1.1,1.1);way["amenity"="parking"](1.0,1.0,1.1,1.1);out;'
@@ -79,6 +83,19 @@ describe('parseAmenityQuery', () => {
   it('rejects unsupported out forms', () => {
     expect(parseAmenityQuery('node["amenity"="toilets"](1.0,1.0,1.1,1.1);out center;')).toBeNull();
     expect(parseAmenityQuery('node["amenity"="toilets"](1.0,1.0,1.1,1.1);out verbatim;')).toBeNull();
+  });
+
+  it('rejects otherwise valid queries with unrecognized QL leftovers', () => {
+    const base = 'node["amenity"="toilets"](1,1,1.1,1.1);';
+    expect(parseAmenityQuery(`${base}way(1,1,1.1,1.1);out;`)).toBeNull();
+    expect(parseAmenityQuery(`${base}node(1,1,1.1,1.1);out;`)).toBeNull();
+    expect(parseAmenityQuery(`${base}out;out count;`)).toBeNull();
+    expect(parseAmenityQuery(`[out:csv]${base}out;`)).toBeNull();
+    expect(parseAmenityQuery(`[adiff:"now"]${base}out;`)).toBeNull();
+    expect(parseAmenityQuery(`(${base}out;)`)).toBeNull();
+    expect(parseAmenityQuery(`${base}out;way["amenity"="toilets"](1,1,1.1,1.1);`)).toBeNull();
+    expect(parseAmenityQuery(`node["amenity"="toilets"](1,1,1.1,1.1);way["amenity"="toilets"](1,1,1.1,1.1);out;`)).toBeNull();
+    expect(parseAmenityQuery(`>;${base}out skel;`)).toBeNull();
   });
 
   it('rejects empty queries', () => {

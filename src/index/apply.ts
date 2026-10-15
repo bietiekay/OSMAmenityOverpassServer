@@ -15,9 +15,11 @@ export const shouldApply = (incomingVersion: number, storedVersion: number | nul
   storedVersion === null || incomingVersion > storedVersion;
 
 export interface InMemoryShard {
-  /** Element id -> element. */
-  elements: Map<number, ShardElement>;
+  /** OSM identity includes type because numeric IDs overlap between types. */
+  elements: Map<string, ShardElement>;
 }
+
+const identity = (type: ShardElement['type'], id: number): string => `${type}:${id}`;
 
 export const emptyShard = (): InMemoryShard => ({ elements: new Map() });
 
@@ -27,16 +29,17 @@ export const upsertElement = (
   shard: InMemoryShard,
   incoming: ShardElement
 ): UpsertResult => {
-  const stored = shard.elements.get(incoming.id);
+  const key = identity(incoming.type, incoming.id);
+  const stored = shard.elements.get(key);
   if (stored && !shouldApply(incoming.version, stored.version)) {
     return 'skipped';
   }
-  shard.elements.set(incoming.id, incoming);
+  shard.elements.set(key, incoming);
   return stored ? 'updated' : 'added';
 };
 
-export const deleteElement = (shard: InMemoryShard, id: number): boolean =>
-  shard.elements.delete(id);
+export const deleteElement = (shard: InMemoryShard, id: number, type: ShardElement['type'] = 'node'): boolean =>
+  shard.elements.delete(identity(type, id));
 
 /**
  * Shard cells affected by an element update (plan §7 step 4): the node's own

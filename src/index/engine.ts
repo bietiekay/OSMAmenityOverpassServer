@@ -11,6 +11,7 @@ import { bboxToCells } from './geohash.js';
 import {
   readShard,
   verifyShard,
+  buildConfigHash,
   type ShardElement
 } from './shard.js';
 import {
@@ -28,6 +29,8 @@ export interface EngineOptions {
   generator: string;
   /** Data-sequence timestamp (ISO 8601) for the osm3s block. */
   osmBaseTimestamp?: string | (() => string | undefined);
+  /** Expected build config; omitted only for compatibility with direct callers. */
+  amenities?: string[];
 }
 
 export interface QueryResult {
@@ -88,6 +91,10 @@ export class ShardCache {
     this.bytes = 0;
   };
 
+  public dropMatching = (matches: (key: string) => boolean): void => {
+    for (const key of this.entries.keys()) if (matches(key)) this.drop(key);
+  };
+
   public usageBytes = (): number => this.bytes;
 
   public evictionCandidates = (): number => this.entries.size;
@@ -115,15 +122,22 @@ const elementMatchesBbox = (element: ShardElement, bbox: BoundingBox): boolean =
       element.lon >= bbox.west && element.lon <= bbox.east
     );
   }
-  // Coarse element-bbox prefilter (plan §8: exact member-coordinate precision
-  // is a Phase-2 refinement; the stored element bbox is already tight).
+  if (element.type === 'way' && element.memberCoords.size > 0) {
+    return [...element.memberCoords.values()].some((point) =>
+      point.lat >= bbox.south && point.lat <= bbox.north &&
+      point.lon >= bbox.west && point.lon <= bbox.east
+    );
+  }
+  // Relations carry only aggregate bounds in OAM1. Their precise member
+  // geometry is unavailable here, so the bounds are the supported predicate.
   return intersects(element.bbox, bbox);
 };
 
 const toOverpassElement = (
   element: ShardElement,
   clause: OutClause,
-  includeMeta: boolean
+  includeMeta: boolean,
+  related: ShardElement[] = []
 ): OverpassElement | null => {
   const out: OverpassElement = { type: element.type, id: element.id };
   if (clause.form === 'tags') {
@@ -139,30 +153,44 @@ const toOverpassElement = (
         out.geometry = element.nodeIds
           .map((nodeId) => {
             const coords = element.memberCoords.get(nodeId);
-            return coords ? [coords.lat, coords.lon] as [number, number] : undefined;
-          })
-          .filter((pair): pair is [number, number] => pair !== undefined);
+            return coords ? { lat: coords.lat, lon: coords.lon } : null;
+          });
       }
     }
     if (element.type === 'relation') {
-      out.members = element.members.map((member) => ({
-        type: (member.type === 'way' || member.type === 'relation' ? member.type : 'node') as
-          | 'node'
-          | 'way'
-          | 'relation',
-        ref: member.ref,
-        role: member.role
-      }));
+      out.members = element.members.map((member) => {
+        const mapped: NonNullable<OverpassElement['members']>[number] = {
+          type: (member.type === 'way' || member.type === 'relation' ? member.type : 'node') as
+            | 'node' | 'way' | 'relation',
+          ref: member.ref,
+          role: member.role
+        };
+        const way = clause.form === 'geom' && member.type === 'way'
+          ? related.find((candidate) => candidate.type === 'way' && candidate.id === member.ref)
+          : undefined;
+        const node = clause.form === 'geom' && member.type === 'node'
+          ? related.find((candidate) => candidate.type === 'node' && candidate.id === member.ref)
+          : undefined;
+        if (node) {
+          mapped.lat = node.lat;
+          mapped.lon = node.lon;
+        }
+        if (way) mapped.geometry = way.nodeIds.map((nodeId) => {
+          const point = way.memberCoords.get(nodeId);
+          return point ? { ...point, ref: nodeId } : null;
+        }).filter((point): point is { lat: number; lon: number; ref: number } => point !== null);
+        return mapped;
+      });
     }
     if (clause.form === 'default' || clause.form === 'body' || clause.form === 'geom') {
       out.tags = { ...element.tags };
     }
   }
-  if (includeMeta && clause.meta) {
+  if (includeMeta && clause.meta && element.version > 0 && element.timestamp > 0) {
     out.meta = {
       version: element.version,
       timestamp: new Date(element.timestamp * 1000).toISOString().replace('.000Z', 'Z'),
-      changeset: element.changeset
+      ...(element.changeset > 0 ? { changeset: element.changeset } : {})
     };
   }
   return out;
@@ -172,7 +200,7 @@ export class AmenityEngine {
   private readonly cache: ShardCache;
   private readonly options: EngineOptions;
   private readonly logger: AppLogger;
-  private cachedCells = new Set<string>();
+  private expectedConfigHash: string | null = null;
   public cacheHits = 0;
   public cacheMisses = 0;
 
@@ -180,7 +208,15 @@ export class AmenityEngine {
     this.options = options;
     this.logger = logger;
     this.cache = new ShardCache(options.cacheMb * 1024 * 1024);
+    if (options.amenities) {
+      this.expectedConfigHash = buildConfigHash({ amenities: options.amenities, precision: options.shardPrecision }).toString('hex');
+    }
   }
+
+  public configureAmenities = (amenities: string[]): void => {
+    this.expectedConfigHash = buildConfigHash({ amenities, precision: this.options.shardPrecision }).toString('hex');
+    this.cache.dropAll();
+  };
 
   /** Number of shard files currently on disk (cheap enough for /api/status). */
   public async countShards(): Promise<number> {
@@ -197,8 +233,12 @@ export class AmenityEngine {
       const manifestRaw = await fs.readFile(
         path.join(this.options.dataDir, 'manifest.json'), 'utf8'
       );
-      const manifest = JSON.parse(manifestRaw) as { totalElements?: number };
-      return Number(manifest.totalElements ?? 0);
+      const manifest = JSON.parse(manifestRaw) as {
+        totalElements?: number;
+        counts?: { shardRecords?: number; mainUnique?: number; supportObjects?: number };
+      };
+      return Number(manifest.totalElements ?? manifest.counts?.shardRecords ??
+        ((manifest.counts?.mainUnique ?? 0) + (manifest.counts?.supportObjects ?? 0)));
     } catch {
       return 0;
     }
@@ -206,28 +246,30 @@ export class AmenityEngine {
 
   /** Drop cached buffers for the affected shard cells (post-update invalidation). */
   public invalidateCells = (cells: string[]): void => {
-    for (const cell of cells) {
-      this.cache.drop(cell);
-      this.cachedCells.delete(cell);
-    }
+    const affected = new Set(cells);
+    this.cache.dropMatching((key) => affected.has(key.slice(key.lastIndexOf(':') + 1)));
   };
 
   public async query(query: ParsedAmenityQuery): Promise<QueryResult> {
+    // Pin a symlinked generation once per request so a publish cannot mix shards.
+    const dataRoot = await fs.realpath(this.options.dataDir);
+    const generation = await this.readGeneration(dataRoot);
+    const stamp = generation.timestamp ?? this.configuredTimestamp();
     const cells = bboxToCells(query.bbox, this.options.shardPrecision);
     if (cells.length === 0) {
-      return this.emptyResult(query.output);
+      return this.emptyResult(query.output, stamp);
     }
 
-    const seen = new Set<number>();
+    const seen = new Set<string>();
     const mainElements: OverpassElement[] = [];
-    const memberNodes = new Map<number, { lat: number; lon: number }>();
-    const memberWays = new Map<number, OverpassElement>();
-    const memberRelations = new Map<number, OverpassElement>();
+    const memberNodes = new Map<number, ShardElement>();
+    const memberWays = new Map<number, ShardElement>();
+    const memberRelations = new Map<number, ShardElement>();
     const mainClause: OutClause =
       query.clauses[0] ?? { form: 'default', meta: false, quiet: false };
 
     for (const cell of cells) {
-      const buffer = await this.loadShard(cell);
+      const buffer = await this.loadShard(cell, dataRoot, generation.declaredShards);
       if (!buffer) {
         continue;
       }
@@ -235,21 +277,26 @@ export class AmenityEngine {
       try {
         shard = readShard(buffer);
       } catch (error) {
-        this.logger.error({ cell, err: String(error) }, 'shard read failed');
-        continue;
+        throw new Error(`shard ${cell} is corrupt: ${String(error)}`);
+      }
+      if ((this.expectedConfigHash && shard.header.configHash !== this.expectedConfigHash) ||
+        (generation.configHash && shard.header.configHash !== generation.configHash)) {
+        throw new Error(`shard ${cell} config hash mismatch`);
       }
       for (const element of shard.elements) {
-        if (seen.has(element.id)) {
+        const identity = `${element.type}:${element.id}`;
+        if (seen.has(identity)) {
           continue;
         }
+        if (!query.types.includes(element.type)) continue;
         if ((element.tags.amenity ?? '') !== query.amenity) {
           continue;
         }
         if (!elementMatchesBbox(element, query.bbox)) {
           continue;
         }
-        seen.add(element.id);
-        const overpass = toOverpassElement(element, mainClause, true);
+        seen.add(identity);
+        const overpass = toOverpassElement(element, mainClause, true, shard.elements);
         if (overpass) {
           mainElements.push(overpass);
         }
@@ -258,7 +305,7 @@ export class AmenityEngine {
             for (const nodeId of element.nodeIds) {
               const coords = element.memberCoords.get(nodeId);
               if (coords && !memberNodes.has(nodeId)) {
-                memberNodes.set(nodeId, coords);
+                memberNodes.set(nodeId, this.syntheticNode(nodeId, coords));
               }
             }
           } else if (element.type === 'relation') {
@@ -266,18 +313,20 @@ export class AmenityEngine {
               if (member.type === 'way') {
                 const way = shard.elements.find((e) => e.type === 'way' && e.id === member.ref);
                 if (way && !memberWays.has(way.id)) {
-                  const skeleton = toOverpassElement(
-                    way, { form: 'skel', meta: false, quiet: false }, false
-                  );
-                  if (skeleton) {
-                    memberWays.set(way.id, skeleton);
+                  memberWays.set(way.id, way);
+                  for (const nodeId of way.nodeIds) {
+                    const coords = way.memberCoords.get(nodeId);
+                    if (coords && !memberNodes.has(nodeId)) memberNodes.set(nodeId, this.syntheticNode(nodeId, coords));
                   }
                 }
               } else if (member.type === 'node') {
                 const node = shard.elements.find((e) => e.type === 'node' && e.id === member.ref);
-                if (node && !memberNodes.has(node.id)) {
-                  memberNodes.set(node.id, { lat: node.lat, lon: node.lon });
+                if (node) {
+                  memberNodes.set(node.id, node);
                 }
+              } else if (member.type === 'relation') {
+                const relation = shard.elements.find((e) => e.type === 'relation' && e.id === member.ref);
+                if (relation && !memberRelations.has(relation.id)) memberRelations.set(relation.id, relation);
               }
             }
           }
@@ -291,27 +340,30 @@ export class AmenityEngine {
 
     const elements: OverpassElement[] = [...mainElements];
     if (memberClause) {
-      for (const [nodeId, coords] of memberNodes) {
-        if (seen.has(nodeId)) {
+      for (const [nodeId, node] of memberNodes) {
+        if (seen.has(`node:${nodeId}`)) {
           continue; // already returned as a main element
         }
-        elements.push({
-          type: 'node', id: nodeId, lat: coords.lat, lon: coords.lon
-        });
+        const converted = toOverpassElement(node, memberClause, true);
+        if (converted) elements.push(converted);
       }
       for (const way of memberWays.values()) {
-        elements.push(way);
+        if (!seen.has(`way:${way.id}`)) {
+          const converted = toOverpassElement(way, memberClause, true);
+          if (converted) elements.push(converted);
+        }
       }
       for (const relation of memberRelations.values()) {
-        elements.push(relation);
+        if (!seen.has(`relation:${relation.id}`)) {
+          const converted = toOverpassElement(relation, memberClause, true);
+          if (converted) elements.push(converted);
+        }
       }
     }
 
-    elements.sort((a, b) => a.id - b.id);
+    elements.sort((a, b) => a.type.localeCompare(b.type) || a.id - b.id);
 
     if (query.output === 'json') {
-      const base = this.options.osmBaseTimestamp;
-      const stamp = typeof base === 'function' ? base() : base;
       const payload = JSON.stringify(
         renderJsonResponse(elements, {
           generator: this.options.generator,
@@ -329,6 +381,7 @@ export class AmenityEngine {
 
     const payload = renderXmlResponse(elements, {
       generator: this.options.generator,
+      osmBaseTimestamp: stamp,
       includeMeta: mainClause.meta
     });
     return {
@@ -339,9 +392,55 @@ export class AmenityEngine {
     };
   }
 
-  private async emptyResult(output: 'json' | 'xml'): Promise<QueryResult> {
+  private configuredTimestamp(): string | undefined {
     const base = this.options.osmBaseTimestamp;
-    const stamp = typeof base === 'function' ? base() : base;
+    return typeof base === 'function' ? base() : base;
+  }
+
+  private syntheticNode(id: number, coords: { lat: number; lon: number }): ShardElement {
+    return {
+      type: 'node', id, version: 0, timestamp: 0, changeset: 0,
+      lat: coords.lat, lon: coords.lon,
+      bbox: [coords.lat, coords.lon, coords.lat, coords.lon],
+      tags: {}, nodeIds: [], memberCoords: new Map(), members: []
+    };
+  }
+
+  private async readGeneration(dataRoot: string): Promise<{ timestamp?: string; configHash?: string; declaredShards?: Set<string> }> {
+    const read = async (name: string): Promise<unknown | null> => {
+      try { return JSON.parse(await fs.readFile(path.join(dataRoot, name), 'utf8')) as unknown; }
+      catch (error) {
+        if ((error as { code?: string }).code === 'ENOENT') return null;
+        throw new Error(`generation metadata ${name} is unreadable: ${String(error)}`);
+      }
+    };
+    const [stateRaw, manifestRaw] = await Promise.all([read('state.json'), read('manifest.json')]);
+    if (stateRaw === null && manifestRaw === null) {
+      throw new Error('index generation is not ready: manifest.json and state.json are missing');
+    }
+    if (stateRaw === null || manifestRaw === null) throw new Error('generation state and manifest must both be present');
+    if (typeof stateRaw !== 'object' || Array.isArray(stateRaw) ||
+      typeof manifestRaw !== 'object' || Array.isArray(manifestRaw)) {
+      throw new Error('generation state and manifest must contain JSON objects');
+    }
+    const state = stateRaw as { dataTimestamp?: unknown };
+    const manifest = manifestRaw as { configHash?: unknown; shards?: unknown };
+    if (!Array.isArray(manifest.shards) ||
+      manifest.shards.some((name) => typeof name !== 'string' || name.length === 0)) {
+      throw new Error('generation manifest must declare its shard inventory');
+    }
+    if (this.expectedConfigHash && manifest.configHash !== this.expectedConfigHash) {
+      throw new Error('generation manifest config hash mismatch');
+    }
+    const declaredShards = new Set(manifest.shards.map((name) => (name as string).replace(/\.bin$/, '')));
+    return {
+      timestamp: typeof state.dataTimestamp === 'string' ? state.dataTimestamp : undefined,
+      configHash: typeof manifest.configHash === 'string' ? manifest.configHash : undefined,
+      declaredShards
+    };
+  }
+
+  private async emptyResult(output: 'json' | 'xml', stamp?: string): Promise<QueryResult> {
     if (output === 'json') {
       const payload = JSON.stringify(
         renderJsonResponse([], {
@@ -354,29 +453,37 @@ export class AmenityEngine {
     }
     const payload = renderXmlResponse([], {
       generator: this.options.generator,
+      osmBaseTimestamp: stamp,
       includeMeta: false
     });
     return { payload, etag: contentEtag(payload), contentType: 'text/xml', elementCount: 0 };
   }
 
-  private async loadShard(cell: string): Promise<Buffer | undefined> {
-    const cached = this.cache.get(cell);
+  private async loadShard(cell: string, dataRoot: string, declaredShards?: Set<string>): Promise<Buffer | undefined> {
+    // A manifest is the authoritative snapshot inventory. Ignore stale files
+    // left behind by an older generation, even when the file is CRC-valid.
+    if (declaredShards && !declaredShards.has(cell)) return undefined;
+    const cacheKey = `${dataRoot}:${cell}`;
+    const cached = this.cache.get(cacheKey);
     if (cached) {
       this.cacheHits += 1;
       return cached;
     }
     this.cacheMisses += 1;
-    const file = path.join(this.options.dataDir, 'shards', `${cell}.bin`);
+    const file = path.join(dataRoot, 'shards', `${cell}.bin`);
     try {
       const buffer = await fs.readFile(file);
       if (!verifyShard(buffer)) {
-        this.logger.error({ cell }, 'shard verification failed');
+        throw new Error(`shard verification failed: ${cell}`);
+      }
+      this.cache.put(cacheKey, buffer);
+      return buffer;
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') {
+        if (declaredShards?.has(cell)) throw new Error(`declared shard is missing: ${cell}`);
         return undefined;
       }
-      this.cache.put(cell, buffer);
-      return buffer;
-    } catch {
-      return undefined;
+      throw error;
     }
   }
 }

@@ -41,11 +41,12 @@ describe('renderJsonResponse', () => {
     expect(response.generator).toBe('test');
     expect(response.osm3s).toEqual({ timestamp_osm_base: '2026-10-14T00:00:00Z' });
     expect(response.elements).toHaveLength(3);
-    expect(response.elements[0].meta).toEqual({
+    expect(response.elements[0]).toMatchObject({
       version: 3,
       timestamp: '2026-10-12T18:22:31Z',
       changeset: 12345678
     });
+    expect(response.elements[0]).not.toHaveProperty('meta');
   });
 
   it('omits osm3s when no base timestamp is given', () => {
@@ -82,6 +83,23 @@ describe('renderXmlResponse', () => {
     const xml = renderXmlResponse(sample, { generator: 'test', includeMeta: false });
     expect(xml).toContain('<node id="1" lat="35.81" lon="139.75">');
     expect(xml).not.toContain('version="3"');
+  });
+
+  it('renders Overpass root metadata and geometry without inventing changesets', () => {
+    const xml = renderXmlResponse([
+      { type: 'way', id: 4, nodes: [10], geometry: [{ lat: 0, lon: 0 }], meta: { version: 2, timestamp: '2026-10-15T00:00:00Z' } },
+      { type: 'relation', id: 5, members: [{ type: 'way', ref: 4, role: 'outer', geometry: [{ ref: 10, lat: 0, lon: 0 }] }] }
+    ], { generator: 'test', osmBaseTimestamp: '2026-10-15T00:00:00Z', includeMeta: true });
+    expect(xml).toContain('<meta osm_base="2026-10-15T00:00:00Z"/>');
+    expect(xml).toContain('<way id="4" version="2" timestamp="2026-10-15T00:00:00Z">');
+    expect(xml).toContain('<nd ref="10" lat="0" lon="0"/>');
+    expect(xml).toContain('<member type="way" ref="4" role="outer">');
+    expect(xml).not.toContain('changeset="0"');
+    const tagsOnly = renderXmlResponse([{ type: 'node', id: 9, tags: { amenity: 'toilets' } }], {
+      generator: 'test', includeMeta: false
+    });
+    expect(tagsOnly).toContain('<node id="9">');
+    expect(tagsOnly).not.toContain('lat="undefined"');
   });
 
   it('renders an empty elements document', () => {

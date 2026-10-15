@@ -2,17 +2,15 @@
 /**
  * OSMAmenityOverpassServer — extraction CLI
  *
- * 4-stage pipeline (plan §6):
- *   Stage 0: block-split the planet .pbf into self-contained chunk files (byte-copy, no decode)
- *   Stage 1: amenity extraction per chunk (osmium + Lua)            [Phase 1]
- *   Stage 2: merge member IDs + coordinate lookup (osmium + Lua)     [Phase 1]
- *   Stage 3: shard assembly into OAM1 binary shards (pure TS)        [Phase 1]
+ * Pipeline stages 0–4 (plan §19):
+ *   Stage 0: split PBF blocks into self-contained chunks.
+ *   Stage 1: stream native osmium XML through the amenity filter.
+ *   Stage 2: resolve global member-way references across chunks.
+ *   Stage 3: resolve member-node coordinates through a sorted streaming merge.
+ *   Stage 4: assemble disk-backed lookups and publish immutable OAM shards.
  *
- * Work units are tracked via done-markers in <work-dir>/state/stage<N>/cNNNN.done,
- * so every stage is abortable and resumable. Outputs are written atomically
- * (tmp + rename).
- *
- * Phase 0 status: Stage 0 fully implemented + verified. Stages 1-3 are stubs.
+ * Fingerprinted work manifests and done-markers support abort and resume.
+ * Outputs use temporary files and rename; activation uses the generation lock.
  *
  * Usage:
  *   node scripts/extract.mjs --planet-source <file.pbf> --data-dir <dir>
@@ -25,94 +23,68 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { stage1 as runStage1Impl, stage2 as runStage2Impl, stage3 as runStage3Impl, validateStageManifest } from './extract/stages.mjs';
+import { buildIndex } from './extract/assembly.mjs';
+import { wasAborted } from './extract/process.mjs';
+import { parseArgs, flagBool, flagInt, parseStages } from './extract/args.mjs';
+import { createReadStream } from 'node:fs';
 
-// ---------------------------------------------------------------------------
-// CLI args
-// ---------------------------------------------------------------------------
-
-function parseArgs(argv) {
-  const args = {};
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (!arg.startsWith('--')) {
-      throw new Error(`Unexpected argument: ${arg}`);
-    }
-    const name = arg.slice(2);
-    const next = argv[i + 1];
-    if (next === undefined || next.startsWith('--')) {
-      args[name] = true;
-    } else {
-      args[name] = next;
-      i += 1;
-    }
-  }
-  return args;
+export async function sourceFingerprint(file) {
+  const h = createHash('sha256');
+  for await (const chunk of createReadStream(file)) h.update(chunk);
+  return h.digest('hex');
 }
-
-function flagBool(args, name, fallback) {
-  if (!(name in args)) return fallback;
-  if (args[name] === true) return true;
-  const v = String(args[name]).toLowerCase();
-  if (['true', '1', 'yes', 'on'].includes(v)) return true;
-  if (['false', '0', 'no', 'off'].includes(v)) return false;
-  throw new Error(`Flag --${name} expects true/false, got: ${args[name]}`);
+export function sourceMetadata(file) {
+  const res = spawnSync('osmium', ['fileinfo', '--json', file], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  if (res.status !== 0) throw new Error(`osmium fileinfo failed: ${res.stderr}`);
+  return sourceMetadataFromHeader(JSON.parse(res.stdout).header);
 }
-
-function flagInt(args, name, fallback) {
-  if (!(name in args)) return fallback;
-  const v = Number(args[name]);
-  if (!Number.isInteger(v) || v <= 0) {
-    throw new Error(`--${name} must be a positive integer, got: ${args[name]}`);
-  }
-  return v;
+export function sourceMetadataFromHeader(header) {
+  const options = header.option ?? {};
+  const baseUrl = options.osmosis_replication_base_url;
+  const sequenceNumber = Number(options.osmosis_replication_sequence_number);
+  const intervalFromUrl = (url) => /(?:^|\/)(minute|hour|day)(?:\/|$)/i.exec(url)?.[1]?.toLowerCase();
+  const intervalFromTimestamp = (url) => /-updates(?:\/|$)/i.test(url) ? 'day' : undefined;
+  return {
+    timestamp: options.osmosis_replication_timestamp ?? options.timestamp ?? null,
+    replication: baseUrl && Number.isSafeInteger(sequenceNumber) ? {
+      baseUrl, sequenceNumber,
+      kind: /planet/i.test(baseUrl) ? 'planet' : 'regional',
+      ...(intervalFromUrl(baseUrl) || intervalFromTimestamp(baseUrl)
+        ? { interval: intervalFromUrl(baseUrl) || intervalFromTimestamp(baseUrl) }
+        : {})
+    } : undefined
+  };
 }
-
-function parseStages(raw) {
-  if (raw === undefined) return [0];
-  const m = String(raw).match(/^(\d+)(?:-(\d+))?$/);
-  if (!m) throw new Error(`--stages must be like "0" or "0-3", got: ${raw}`);
-  const from = Number(m[1]);
-  const to = m[2] === undefined ? from : Number(m[2]);
-  if (from < 0 || to > 3 || from > to) {
-    throw new Error(`--stages must be within 0..3, got: ${raw}`);
-  }
-  return Array.from({ length: to - from + 1 }, (_, i) => from + i);
-}
-
-const args = parseArgs(process.argv.slice(2));
-const PLANET_SOURCE = args['planet-source'];
-const DATA_DIR = args['data-dir'] ? path.resolve(args['data-dir']) : path.resolve('.');
-const STAGES = parseStages(args.stages);
-const CHUNK_MB = flagInt(args, 'chunk-mb', 1024);
-const WORKERS = flagInt(args, 'workers', Math.max(1, Math.min(os.cpus().length, Math.floor(8192 / 2048))));
-const KEEP_CHUNKS = flagBool(args, 'keep-chunks', true);
-const ALL_AMENITY_VALUES = flagBool(args, 'all-amenity-values', true);
-const VERIFY = flagBool(args, 'verify', false);
-
-const WORK_DIR = path.join(DATA_DIR, 'work');
-const CHUNKS_DIR = path.join(WORK_DIR, 'chunks');
-const STATE_DIR = path.join(WORK_DIR, 'state');
 
 const log = (...parts) => console.log(new Date().toISOString(), ...parts);
+export function createRunConfig(argv = [], cwd = process.cwd(), cpuCount = os.cpus().length) {
+  const args = parseArgs(argv);
+  const dataDir = args['data-dir'] ? path.resolve(cwd, args['data-dir']) : path.resolve(cwd);
+  const stages = parseStages(args.stages);
+  const chunkMb = flagInt(args, 'chunk-mb', 1024);
+  const shardPrecision = flagInt(args, 'shard-precision', 5);
+  const ramMb = flagInt(args, 'ram-mb', 8192);
+  const workerRamMb = flagInt(args, 'worker-ram-mb', 2048);
+  const reserveMb = 512;
+  const maxWorkers = Math.floor((ramMb - reserveMb) / workerRamMb);
+  if (maxWorkers < 1) throw new Error(`--ram-mb must exceed ${reserveMb} MB and leave room for at least one --worker-ram-mb`);
+  const workers = Math.min(flagInt(args, 'workers', Math.max(1, Math.min(cpuCount, maxWorkers))), maxWorkers, cpuCount);
+  return { args, source: args.source ?? args['planet-source'], dataDir, stages, chunkMb, shardPrecision, ramMb, workerRamMb, workers,
+    keepChunks: flagBool(args, 'keep-chunks', true), allAmenityValues: flagBool(args, 'all-amenity-values', true), verify: flagBool(args, 'verify', false),
+    amenities: String(args.amenities ?? 'toilets').split(',').filter(Boolean) };
+}
 
 // ---------------------------------------------------------------------------
 // PBF block scanning
 //
-// Two framings are supported:
-//   new (osmium >= 1.14 / libosmium >= 2.18):
-//     [u32be BlobHeader length][BlobHeader][datasize bytes of blob]
-//     BlobHeader proto: field 1 = type string ("OSMHeader"/"OSMData"),
-//                       field 3 = varint datasize (size of the following blob)
-//   classic (OSM 2016+ planet files):
-//     [varint BlobHeader length][BlobHeader][size bytes of blob]
-//     BlobHeader proto: field 1 = varint blob size, field 2 = varint type
-//                       (1 = OSMHeader, 2 = OSMData)
-// Both frame the blob as self-contained bytes, so chunks are byte copies.
+// Standard OSM PBF framing: [u32be BlobHeader length][BlobHeader][Blob bytes].
 // ---------------------------------------------------------------------------
 
 const MAX_BLOB_HEADER = 64 * 1024;
 
-function readVarintFromBuffer(buf, offset) {
+export function readVarintFromBuffer(buf, offset) {
   let result = 0;
   let shift = 0;
   let pos = offset;
@@ -132,7 +104,7 @@ function readVarintFromBuffer(buf, offset) {
  * type is the type string ("OSMHeader"/"OSMData"), datasize the number of
  * blob bytes that follow the header.
  */
-function parseBlobHeaderNew(headerBuf) {
+export function parseBlobHeaderNew(headerBuf) {
   let type = null;
   let datasize = null;
   let pos = 0;
@@ -160,67 +132,29 @@ function parseBlobHeaderNew(headerBuf) {
   return { type, datasize };
 }
 
-/**
- * Parse a BlobHeader in the classic framing. Returns { type, datasize } with
- * type as name string, datasize = blob size (field 1); null if the header
- * does not have the classic shape.
- */
-function parseBlobHeaderClassic(headerBuf) {
-  let size = null;
-  let type = null;
-  let pos = 0;
-  while (pos < headerBuf.length) {
-    const [tag, next] = readVarintFromBuffer(headerBuf, pos);
-    pos = next;
-    const field = tag >>> 3;
-    const wire = tag & 7;
-    if (wire === 0) {
-      const [value, after] = readVarintFromBuffer(headerBuf, pos);
-      if (field === 1) size = value;
-      if (field === 2) type = value;
-      pos = after;
-    } else if (wire === 2) {
-      const [len, after] = readVarintFromBuffer(headerBuf, pos);
-      pos = after + len;
-    } else if (wire === 1) {
-      pos += 8;
-    } else if (wire === 5) {
-      pos += 4;
-    } else {
-      throw new Error(`unsupported wire type ${wire} in classic BlobHeader`);
-    }
-  }
-  if (type !== 1 && type !== 2) return null;
-  return { type: type === 1 ? 'OSMHeader' : 'OSMData', datasize: size };
-}
-
 function readBytesAt(fd, offset, length) {
   const buf = Buffer.allocUnsafe(length);
   const read = fs.readSync(fd, buf, 0, length, offset);
   if (read < length) throw new Error(`truncated read at offset ${offset} (got ${read} of ${length})`);
   return buf;
 }
+async function hashFile(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
 
 /**
- * Detect the PBF framing of the first block: 'new' or 'classic'.
+ * Validate and detect standard OSM PBF framing.
  */
-function detectFormat(fd) {
+export function detectFormat(fd) {
   const head4 = readBytesAt(fd, 0, 4);
   const newLen = head4.readUInt32BE(0);
   if (newLen > 0 && newLen <= MAX_BLOB_HEADER) {
     const parsed = parseBlobHeaderNew(readBytesAt(fd, 4, newLen));
     if (parsed.type === 'OSMHeader' && parsed.datasize > 0) return 'new';
   }
-  const win = readBytesAt(fd, 0, 16);
-  const [headerLen, afterVarint] = readVarintFromBuffer(win, 0);
-  if (headerLen <= 0 || headerLen > MAX_BLOB_HEADER) {
-    throw new Error('unrecognised PBF framing (neither osmium >= 1.14 nor classic layout)');
-  }
-  const parsed = parseBlobHeaderClassic(readBytesAt(fd, afterVarint, headerLen));
-  if (!parsed || parsed.type !== 'OSMHeader' || !(parsed.datasize > 0)) {
-    throw new Error('unrecognised PBF framing (neither osmium >= 1.14 nor classic layout)');
-  }
-  return 'classic';
+  throw new Error('unrecognised OSM PBF framing (expected 4-byte big-endian BlobHeader length)');
 }
 
 /**
@@ -230,7 +164,7 @@ function detectFormat(fd) {
  * must be consumed exactly, and block types must be OSMHeader followed by
  * OSMData only.
  */
-function scanBlocks(filePath) {
+export function scanBlocks(filePath) {
   const fd = fs.openSync(filePath, 'r');
   const stat = fs.fstatSync(fd);
   const mode = detectFormat(fd);
@@ -248,17 +182,6 @@ function scanBlocks(filePath) {
         }
         blocks.push({ index: blocks.length, offset, length: 4 + headerLen + parsed.datasize, type: parsed.type });
         offset += 4 + headerLen + parsed.datasize;
-      } else {
-        const win = Buffer.allocUnsafe(16);
-        const winRead = fs.readSync(fd, win, 0, 16, offset);
-        if (winRead === 0) throw new Error(`truncated at offset ${offset}`);
-        const [headerLen, afterVarint] = readVarintFromBuffer(win.subarray(0, winRead), 0);
-        if (headerLen === 0) break;
-        if (headerLen > MAX_BLOB_HEADER) throw new Error(`BlobHeader too large at offset ${offset}`);
-        const parsed = parseBlobHeaderClassic(readBytesAt(fd, offset + afterVarint, headerLen));
-        if (!parsed || !(parsed.datasize > 0)) throw new Error(`bad BlobHeader at offset ${offset}`);
-        blocks.push({ index: blocks.length, offset, length: afterVarint + headerLen + parsed.datasize, type: parsed.type });
-        offset += afterVarint + headerLen + parsed.datasize;
       }
     }
   } finally {
@@ -284,31 +207,34 @@ function chunkId(n) {
   return `c${String(n).padStart(4, '0')}`;
 }
 
-function doneMarker(stage, unit) {
-  return path.join(STATE_DIR, `stage${stage}`, `${unit}.done`);
+function doneMarker(dataDir, stage, unit) {
+  return path.join(dataDir, 'work/state', `stage${stage}`, `${unit}.done`);
 }
 
-function isDone(stage, unit) {
-  return fs.existsSync(doneMarker(stage, unit));
-}
-
-function markDone(stage, unit, payload) {
-  const file = doneMarker(stage, unit);
+function markDone(dataDir, stage, unit, payload) {
+  const file = doneMarker(dataDir, stage, unit);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(payload, null, 2));
   fs.renameSync(tmp, file);
 }
 
-function runStage0({ planetSource }) {
-  log(`stage 0: scanning ${planetSource} ...`);
+export async function runStage0({ planetSource, fingerprint, metadata = {}, dataDir = process.cwd(), chunkMb = 1024, keepChunks = true, logger = log }) {
+  const WORK_DIR = path.join(dataDir, 'work');
+  const CHUNKS_DIR = path.join(WORK_DIR, 'chunks');
+  const STATE_DIR = path.join(WORK_DIR, 'state');
+  logger(`stage 0: scanning ${planetSource} ...`);
   const { blocks, fileSize } = scanBlocks(planetSource);
   const dataBlocks = blocks.slice(1);
-  const targetBytes = CHUNK_MB * 1024 * 1024;
-  log(`found ${blocks.length} blocks (${(fileSize / 1e9).toFixed(2)} GB), ` +
-    `${dataBlocks.length} data blocks, target chunk size ${CHUNK_MB} MB`);
+  const targetBytes = chunkMb * 1024 * 1024;
+  logger(`found ${blocks.length} blocks (${(fileSize / 1e9).toFixed(2)} GB), ` +
+    `${dataBlocks.length} data blocks, target chunk size ${chunkMb} MB`);
 
-  // Group data blocks into chunks of roughly CHUNK_MB compressed bytes.
+  const previousPath = path.join(WORK_DIR, 'manifest.json');
+  let previous;
+  try { previous = JSON.parse(fs.readFileSync(previousPath, 'utf8')); } catch {}
+
+  // Group data blocks into chunks of roughly chunkMb compressed bytes.
   const groups = [];
   let current = [];
   let currentBytes = blocks[0].length; // header block travels with every chunk
@@ -329,15 +255,42 @@ function runStage0({ planetSource }) {
   }
   if (current.length > 0) groups.push(current);
 
-  fs.mkdirSync(CHUNKS_DIR, { recursive: true });
-  log(`writing ${groups.length} chunks -> ${CHUNKS_DIR}`);
+  let legacyUpgrade = false;
+  if (previous && !previous.sourceFingerprint && previous.planetSizeBytes === fileSize && previous.chunks?.length === groups.length) {
+    legacyUpgrade = true;
+    for (let i = 0; i < groups.length; i += 1) {
+      const id = chunkId(i); const markerPath = doneMarker(dataDir, 0, id); const outPath = path.join(CHUNKS_DIR, `${id}.pbf`);
+      let marker;
+      try { marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch { legacyUpgrade = false; break; }
+      const bytes = blocks[0].length + groups[i].reduce((sum, b) => sum + b.length, 0);
+      const expectedBlocks = [0, ...groups[i].map((b) => b.index)];
+      if (marker.fingerprint !== fingerprint || marker.bytes !== bytes || JSON.stringify(marker.blocks) !== JSON.stringify(expectedBlocks) || !fs.existsSync(outPath) || fs.statSync(outPath).size !== bytes || marker.sha256 !== await hashFile(outPath)) { legacyUpgrade = false; break; }
+    }
+    if (legacyUpgrade) logger('stage 0: upgrading validated legacy chunk manifest; preserving reusable stage 1 outputs');
+  }
+  if (!legacyUpgrade && (!previous || previous.sourceFingerprint !== fingerprint || previous.chunkTargetMb !== chunkMb || previous.complete !== true)) {
+    logger('stage 0: source, chunk target, or work manifest changed; clearing downstream stage data');
+    for (const n of [1, 2, 3]) {
+      fs.rmSync(path.join(WORK_DIR, `stage${n}`), { recursive: true, force: true });
+      fs.rmSync(path.join(STATE_DIR, `stage${n}`), { recursive: true, force: true });
+    }
+  }
 
-  const fdSource = fs.openSync(planetSource, 'r');
+  fs.mkdirSync(CHUNKS_DIR, { recursive: true });
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  fs.mkdirSync(path.join(STATE_DIR, 'stage0'), { recursive: true });
+  logger(`writing ${groups.length} chunks -> ${CHUNKS_DIR}`);
+
+  const fdSource = await fs.promises.open(planetSource, 'r');
   const manifest = {
-    planetSource,
+    planetSource: path.resolve(planetSource),
+    sourceFingerprint: fingerprint,
+    sourceTimestamp: metadata.timestamp,
+    replication: metadata.replication ?? null,
     planetSizeBytes: fileSize,
     blockCount: blocks.length,
-    chunkTargetMb: CHUNK_MB,
+    chunkTargetMb: chunkMb,
+    complete: false,
     createdAt: new Date().toISOString(),
     chunks: []
   };
@@ -345,7 +298,7 @@ function runStage0({ planetSource }) {
   let interrupted = false;
   const onSignal = (signal) => {
     interrupted = true;
-    log(`received ${signal}, finishing current chunk then stopping (resume with the same command)`);
+    logger(`received ${signal}, finishing current chunk then stopping (resume with the same command)`);
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
@@ -353,60 +306,82 @@ function runStage0({ planetSource }) {
   try {
     for (let i = 0; i < groups.length; i += 1) {
       const id = chunkId(i);
-      if (isDone(0, id)) {
-        manifest.chunks.push({ id, skip: true });
+      const outPath = path.join(CHUNKS_DIR, `${id}.pbf`);
+      const marker = doneMarker(dataDir, 0, id);
+      let markerData;
+      try { markerData = JSON.parse(fs.readFileSync(marker, 'utf8')); } catch {}
+      const expectedLength = blocks[0].length + groups[i].reduce((sum, b) => sum + b.length, 0);
+      const expectedBlocks = [0, ...groups[i].map((b) => b.index)];
+      if (markerData?.fingerprint === fingerprint && JSON.stringify(markerData.blocks) === JSON.stringify(expectedBlocks) && markerData.bytes === expectedLength && fs.existsSync(outPath) && fs.statSync(outPath).size === expectedLength && markerData.sha256 === await hashFile(outPath)) {
+        manifest.chunks.push({ id, file: `${id}.pbf`, blocks: markerData.blocks, bytes: expectedLength, sha256: markerData.sha256 });
         continue;
       }
       const group = groups[i];
-      const outPath = path.join(CHUNKS_DIR, `${id}.pbf`);
       const tmpPath = `${outPath}.tmp-${process.pid}`;
-      const fdOut = fs.openSync(tmpPath, 'w');
+      const fdOut = await fs.promises.open(tmpPath, 'w');
+      const outputHash = createHash('sha256');
       try {
         for (const block of [blocks[0], ...group]) {
           const buf = Buffer.allocUnsafe(block.length);
-          fs.readSync(fdSource, buf, 0, block.length, block.offset);
-          fs.writeSync(fdOut, buf);
+          const { bytesRead } = await fdSource.read(buf, 0, block.length, block.offset);
+          if (bytesRead !== block.length) throw new Error(`truncated source block at ${block.offset}`);
+          outputHash.update(buf);
+          let written = 0;
+          while (written < buf.length) written += (await fdOut.write(buf, written, buf.length - written)).bytesWritten;
         }
       } finally {
-        fs.closeSync(fdOut);
+        await fdOut.close();
       }
       fs.renameSync(tmpPath, outPath);
-      markDone(0, id, {
+      const chunkHash = outputHash.digest('hex');
+      markDone(dataDir, 0, id, {
         id,
-        blocks: [0, ...group.map((b) => b.index)],
+        fingerprint,
+        blocks: expectedBlocks,
         bytes: fs.statSync(outPath).size,
+        sha256: chunkHash,
         createdAt: new Date().toISOString()
       });
       manifest.chunks.push({
         id,
         file: `${id}.pbf`,
-        blocks: [0, ...group.map((b) => b.index)],
-        bytes: fs.statSync(outPath).size
+        blocks: expectedBlocks,
+        bytes: fs.statSync(outPath).size,
+        sha256: chunkHash
       });
       if ((i + 1) % 5 === 0 || i === groups.length - 1) {
-        log(`  chunk ${id + 1}/${groups.length} done`);
+        logger(`  chunk ${id + 1}/${groups.length} done`);
       }
       if (interrupted) break;
     }
   } finally {
-    fs.closeSync(fdSource);
+    await fdSource.close();
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
   }
 
   const tmpManifest = path.join(WORK_DIR, 'manifest.json.tmp');
+  manifest.complete = !interrupted && manifest.chunks.length === groups.length;
   fs.writeFileSync(tmpManifest, JSON.stringify(manifest, null, 2));
   fs.renameSync(tmpManifest, path.join(WORK_DIR, 'manifest.json'));
 
   if (interrupted) {
-    log(`stage 0 stopped after signal; resume with the same command (done chunks are skipped).`);
+    logger(`stage 0 stopped after signal; resume with the same command (done chunks are skipped).`);
     return { complete: false };
   }
 
-  if (!KEEP_CHUNKS) {
-    log('--keep-chunks=false set, but chunks are kept until stage 2 finishes (they are still needed for re-extract).');
+  const keep = new Set(groups.map((_, i) => `${chunkId(i)}.pbf`));
+  for (const name of fs.readdirSync(CHUNKS_DIR)) {
+    if (/^c\d{4}\.pbf$/.test(name) && !keep.has(name)) fs.rmSync(path.join(CHUNKS_DIR, name));
   }
-  log('stage 0 complete');
+  for (const name of fs.readdirSync(path.join(STATE_DIR, 'stage0'))) {
+    if (/^c\d{4}\.done$/.test(name) && !keep.has(name.replace('.done', '.pbf'))) fs.rmSync(path.join(STATE_DIR, 'stage0', name));
+  }
+
+  if (!keepChunks) {
+    logger('--keep-chunks=false set, but chunks are kept until stage 2 finishes (they are still needed for re-extract).');
+  }
+  logger('stage 0 complete');
   return { complete: true };
 }
 
@@ -414,50 +389,58 @@ function runStage0({ planetSource }) {
 // Verification (osmium)
 // ---------------------------------------------------------------------------
 
-function osmiumNumObjects(file) {
-  const quoted = `'${file.replace(/'/g, `'\\''`)}'`;
-  // osmium show prints ANSI colours; strip them, then count object lines.
-  const awkProg =
-    '{ gsub(/\\033\\[[0-9;]*m/, "") } /^node / { n++ } /^way / { w++ } /^relation / { r++ } END { printf "%d %d %d", n+0, w+0, r+0 }';
-  const res = spawnSync('sh', ['-c', `osmium show ${quoted} | awk '${awkProg}'`], {
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024
-  });
+export function osmiumNumObjects(file) {
+  const res = spawnSync('osmium', ['fileinfo', '-e', '--json', file], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
   if (res.error) throw res.error;
-  if (res.status !== 0) {
-    throw new Error(`osmium show failed on ${file}: ${res.stderr || res.stdout}`);
+  if (res.status === 0) {
+    let info;
+    try { info = JSON.parse(res.stdout); } catch (error) { throw new Error(`invalid osmium fileinfo JSON for ${file}: ${error.message}`); }
+    const count = info.data?.count;
+    if (!count || !['nodes', 'ways', 'relations'].every((key) => Number.isSafeInteger(count[key]))) throw new Error(`osmium fileinfo omitted object counts for ${file}`);
+    return { nodes: count.nodes, ways: count.ways, relations: count.relations };
   }
-  const [nodes, ways, relations] = res.stdout.trim().split(/\s+/).map(Number);
-  return { nodes, ways, relations };
+  // Osmium 1.14's JSON formatter tries to serialize an undefined bbox and
+  // fails on valid way/relation-only extracts. Its plain extended report does
+  // not compute a geometry bbox, so safely fall back only for that known bug.
+  if (!/Geometry error: Invalid location/.test(res.stderr || '')) throw new Error(`osmium fileinfo failed on ${file}: ${res.stderr || res.stdout}`);
+  const fallback = spawnSync('osmium', ['fileinfo', '-e', '--no-crc', file], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  if (fallback.error) throw fallback.error;
+  if (fallback.status !== 0) throw new Error(`osmium fileinfo fallback failed on ${file}: ${fallback.stderr || fallback.stdout}`);
+  const count = {};
+  for (const [key, label] of [['nodes', 'nodes'], ['ways', 'ways'], ['relations', 'relations']]) {
+    const match = new RegExp(`Number of ${label}:\\s+(\\d+)`).exec(fallback.stdout);
+    if (!match || !Number.isSafeInteger(Number(match[1]))) throw new Error(`osmium fileinfo fallback omitted ${key} count for ${file}`);
+    count[key] = Number(match[1]);
+  }
+  return count;
 }
 
-function runVerify({ planetSource }) {
-  log('verifying with osmium show ...');
-  const planet = osmiumNumObjects(planetSource);
-  log(`planet: ${planet.nodes} nodes, ${planet.ways} ways, ${planet.relations} relations`);
+export function runVerify({ planetSource, chunksDir = path.resolve('work/chunks'), logger = log, countObjects = osmiumNumObjects }) {
+  logger('verifying with osmium fileinfo ...');
+  const planet = countObjects(planetSource);
+  logger(`planet: ${planet.nodes} nodes, ${planet.ways} ways, ${planet.relations} relations`);
 
-  const chunkFiles = fs.readdirSync(CHUNKS_DIR).filter((f) => /^c\d{4}\.pbf$/.test(f)).sort();
+  const chunkFiles = fs.readdirSync(chunksDir).filter((f) => /^c\d{4}\.pbf$/.test(f)).sort();
   let total = { nodes: 0, ways: 0, relations: 0 };
   let totalBytes = 0;
   for (const file of chunkFiles) {
-    const counts = osmiumNumObjects(path.join(CHUNKS_DIR, file));
+    const counts = countObjects(path.join(chunksDir, file));
     total.nodes += counts.nodes;
     total.ways += counts.ways;
     total.relations += counts.relations;
-    totalBytes += fs.statSync(path.join(CHUNKS_DIR, file)).size;
+    totalBytes += fs.statSync(path.join(chunksDir, file)).size;
   }
-  log(`chunks: ${total.nodes} nodes, ${total.ways} ways, ${total.relations} relations`);
-  log(`chunk total size: ${(totalBytes / 1e9).toFixed(2)} GB (${(totalBytes / 1e6).toFixed(0)} MB)`);
+  logger(`chunks: ${total.nodes} nodes, ${total.ways} ways, ${total.relations} relations`);
+  logger(`chunk total size: ${(totalBytes / 1e9).toFixed(2)} GB (${(totalBytes / 1e6).toFixed(0)} MB)`);
 
   const ok =
     total.nodes === planet.nodes &&
     total.ways === planet.ways &&
     total.relations === planet.relations;
   if (ok) {
-    log('VERIFY OK: chunk object counts match the planet file');
+    logger('VERIFY OK: chunk object counts match the planet file');
   } else {
-    log('VERIFY FAILED: counts differ from planet file');
-    process.exitCode = 1;
+    logger('VERIFY FAILED: counts differ from planet file');
   }
   return ok;
 }
@@ -466,44 +449,79 @@ function runVerify({ planetSource }) {
 // Stages 1-3 (Phase 1)
 // ---------------------------------------------------------------------------
 
-function runStage1() {
-  throw new Error('Stage 1 (amenity extraction, osmium+Lua) is implemented in Phase 1');
-}
-
-function runStage2() {
-  throw new Error('Stage 2 (member ID merge + coordinate lookup) is implemented in Phase 1');
-}
-
-function runStage3() {
-  throw new Error('Stage 3 (shard assembly) is implemented in Phase 1');
-}
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-async function main() {
-  log(`data dir: ${DATA_DIR}`);
-  log(`stages: ${STAGES.join(',')} | chunk-mb: ${CHUNK_MB} | workers: ${WORKERS} | ` +
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const config = createRunConfig(argv, deps.cwd ?? process.cwd(), deps.cpuCount ?? os.cpus().length);
+  const { source, dataDir: DATA_DIR, stages: STAGES, chunkMb: CHUNK_MB, shardPrecision: SHARD_PRECISION, ramMb: RAM_MB,
+    workerRamMb: WORKER_RAM_MB, workers: WORKERS, keepChunks: KEEP_CHUNKS, allAmenityValues: ALL_AMENITY_VALUES, verify: VERIFY, amenities } = config;
+  const logger = deps.logger ?? log;
+  const stage0 = deps.runStage0 ?? runStage0;
+  const stage1 = deps.stage1 ?? runStage1Impl;
+  const stage2 = deps.stage2 ?? runStage2Impl;
+  const stage3 = deps.stage3 ?? runStage3Impl;
+  const assemble = deps.buildIndex ?? buildIndex;
+  const fingerprintFile = deps.sourceFingerprint ?? sourceFingerprint;
+  const readSourceMetadata = deps.sourceMetadata ?? sourceMetadata;
+  const aborted = deps.wasAborted ?? wasAborted;
+  logger(`data dir: ${DATA_DIR}`);
+  logger(`stages: ${STAGES.join(',')} | chunk-mb: ${CHUNK_MB} | workers: ${WORKERS} (RAM ${RAM_MB} MB, worker ${WORKER_RAM_MB} MB) | ` +
     `keep-chunks: ${KEEP_CHUNKS} | all-amenity-values: ${ALL_AMENITY_VALUES}`);
 
+  if (source && !fs.existsSync(source)) throw new Error(`source not found: ${source}`);
+  const WORK_DIR = path.join(DATA_DIR, 'work');
+  const stageOpts = { root: DATA_DIR, workers: WORKERS, workerRamMb: WORKER_RAM_MB, keepChunks: KEEP_CHUNKS || VERIFY, allAmenities: ALL_AMENITY_VALUES, amenities };
+  let priorManifest = null;
+  try { priorManifest = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'manifest.json'), 'utf8')); } catch {}
+  if (!source && STAGES.includes(0)) throw new Error('--source <file.pbf> is required for stage 0');
+  if (source) {
+    stageOpts.sourceFingerprint = await fingerprintFile(source);
+    stageOpts.sourceMetadata = readSourceMetadata(source);
+    stageOpts.source = path.resolve(source);
+  } else {
+    if (!priorManifest?.sourceFingerprint || !Array.isArray(priorManifest.chunks)) throw new Error('source omitted and no work/manifest.json provenance is available');
+    stageOpts.sourceFingerprint = priorManifest.sourceFingerprint;
+    stageOpts.sourceMetadata = { timestamp: priorManifest.sourceTimestamp ?? null, replication: priorManifest.replication ?? null };
+    stageOpts.source = priorManifest.planetSource;
+  }
+  if (aborted()) return;
   for (const stage of STAGES) {
+    if (stage > 0) logger(`stage ${stage}: starting`);
     if (stage === 0) {
-      if (!PLANET_SOURCE) throw new Error('--planet-source <file.pbf> is required for stage 0');
-      if (!fs.existsSync(PLANET_SOURCE)) throw new Error(`planet source not found: ${PLANET_SOURCE}`);
-      runStage0({ planetSource: PLANET_SOURCE });
-    } else if (stage === 1) runStage1();
-    else if (stage === 2) runStage2();
-    else if (stage === 3) runStage3();
+      if (!source) throw new Error('--source <file.pbf> is required for stage 0');
+      if (!fs.existsSync(source)) throw new Error(`source not found: ${source}`);
+      const result = await stage0({ planetSource: source, fingerprint: stageOpts.sourceFingerprint, metadata: stageOpts.sourceMetadata, dataDir: DATA_DIR, chunkMb: CHUNK_MB, keepChunks: KEEP_CHUNKS || VERIFY, logger });
+      if (!result.complete) return;
+    } else if (stage === 1) await stage1(stageOpts);
+    else if (stage === 2) await stage2(stageOpts);
+    else if (stage === 3) await stage3(stageOpts);
+    else if (stage === 4) {
+      const current = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'manifest.json'), 'utf8'));
+      if (current.complete !== true) throw new Error('Stage 0 work manifest is incomplete; resume stage 0 first');
+      if (current.sourceFingerprint !== stageOpts.sourceFingerprint) throw new Error('work manifest source differs from requested source; run stage 0 first');
+      const chunkIds = current.chunks?.map((c) => c.id);
+      if (!Array.isArray(chunkIds) || !chunkIds.length) throw new Error('work manifest has no expected chunks');
+      for (const n of [1, 2, 3]) await validateStageManifest(DATA_DIR, n, stageOpts.sourceFingerprint, chunkIds);
+      const s1 = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'stage1/manifest.json'), 'utf8'));
+      if (!s1.config?.allAmenities && stageOpts.amenities.some((value) => !(s1.config.amenities || []).includes(value))) throw new Error('Stage 4 amenity values were not retained by Stage 1; rerun stage 1 with those values or --all-amenity-values true');
+      await assemble({ pipelineDir: DATA_DIR, source: stageOpts.source, expectedChunkIds: chunkIds, amenities: stageOpts.amenities, shardPrecision: SHARD_PRECISION, ramMB: RAM_MB, sourceTimestamp: stageOpts.sourceMetadata.timestamp, sourceFingerprint: stageOpts.sourceFingerprint, replication: stageOpts.sourceMetadata.replication });
+    }
+    if (aborted()) return;
   }
 
   if (STAGES.includes(0) && VERIFY) {
-    if (!PLANET_SOURCE) throw new Error('--verify requires --planet-source');
-    runVerify({ planetSource: PLANET_SOURCE });
+    if (!source) throw new Error('--verify requires --source');
+    if (!runVerify({ planetSource: source, chunksDir: path.join(WORK_DIR, 'chunks'), logger, countObjects: deps.countObjects ?? osmiumNumObjects })) process.exitCode = 1;
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+export async function runCli(argv = process.argv.slice(2), deps = {}) {
+  try { await main(argv, deps); return 0; }
+  catch (error) { (deps.onError ?? console.error)(error); return 1; }
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  runCli().then((status) => { if (status !== 0) process.exitCode = status; });
+}

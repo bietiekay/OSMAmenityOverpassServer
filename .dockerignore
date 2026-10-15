@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+coverage
+.vitest
+data
+data.new
+work
+fixtures
+pipeline
+*.pbf
+*.osc.gz
+docker-compose.yml

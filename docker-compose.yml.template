@@ -1,51 +1,26 @@
-version: '3.3'
 services:
   amenity-server:
     build: .
     restart: unless-stopped
     environment:
-      # Required
       PORT: 8081
-      OSM_AMENITY_DATA_DIR: /data
-      # A comma-separated list of amenity values to serve (normalised trim().toLowerCase())
+      OSM_AMENITY_DATA_DIR: /osm/data
+      OSM_AMENITY_SOURCE_PBF: /source/region.osm.pbf
       OSM_AMENITY_AMENITIES: toilets
-      # Geohash shard precision (= proxy tile precision, default 5)
-      # OSM_AMENITY_SHARD_PRECISION: 5
-      # LRU byte budget for the in-process shard cache (MB)
-      # OSM_AMENITY_SHARD_CACHE_MB: 256
-      # Update loop: wake interval in seconds (default hourly). The update source is always
-      # the minute replication files; the interval only controls how often catch-up runs.
-      # OSM_AMENITY_UPDATE_INTERVAL_SECONDS: 3600
-      # OSM_AMENITY_UPDATE_BASE_URL: https://planet.openstreetmap.org/replication
-      # Weekly drift-guard re-extract trigger (0 = disabled)
+      # Defaults: precision 5, 256 MB cache, hourly update-loop wake interval.
+      # For Japan Geofabrik daily replication:
+      # OSM_AMENITY_UPDATE_BASE_URL: https://download.geofabrik.de/asia/japan-updates
       # OSM_AMENITY_REEXTRACT_EVERY_SECONDS: 604800
-      # Optional: reach the Overpass-Proxy Redis directly to invalidate affected tile keys
-      # after each update batch (key schema: tile:<amenity>:<geohash5>)
-      # OSM_AMENITY_REDIS_URL: redis://redis:6379
       # LOG_VERBOSITY: info
     ports:
       - "127.0.0.1:8081:8081"
     volumes:
-      # The index is produced by scripts/extract.mjs on the host machine (not inside this container).
-      - ./data:/data:ro
+      # Writable pipeline root: active data link, immutable generations, and work/.
+      - ${OSM_AMENITY_PIPELINE_DIR:-./pipeline}:/osm:rw
+      # Retained source PBF is mounted read-only at the path supplied above.
+      - ${OSM_AMENITY_SOURCE_PBF_HOST:?Set OSM_AMENITY_SOURCE_PBF_HOST to a retained PBF file}:/source/region.osm.pbf:ro
 
-# ---------------------------------------------------------------------------
-# Full stack: add the unmodified Overpass-Proxy in front, pointing at both the
-# local amenity-server (preferred, via EWMA latency) and the remote pool.
-#
-#   proxy:
-#     image: <your overpass-proxy build>
-#     environment:
-#       PORT: 8080
-#       REDIS_URL: redis://redis:6379
-#       UPSTREAM_URLS: http://amenity-server:8081/api/interpreter, https://overpass-api.de/api/interpreter, https://overpass.kumi.systems/api/interpreter
-#     ports:
-#       - "127.0.0.1:5002:8080"
-#
-#   redis:
-#     image: redis:7-alpine
-#     ports:
-#       - "127.0.0.1:6380:6379"
-#     volumes:
-#       - ./redis-data:/data
-# ---------------------------------------------------------------------------
+# Add the unmodified Overpass-Proxy as another service and point UPSTREAM_URLS
+# at http://amenity-server:8081/api/interpreter followed by remote fallback URLs.
+# Docker packaging is provided for deployment; it has not been built or tested
+# as part of local verification.

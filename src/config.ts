@@ -1,10 +1,8 @@
 /**
  * Server configuration from the OSM_AMENITY_* environment namespace (plan §11).
  *
- * The update source is always the minute replication files (user spec: OSM planet
- * minute diffs); the interval only controls how often the catch-up loop wakes.
- * The canonical data-age cursor is therefore the minute sequence number, which
- * /api/status reports as osm_osm_change (conformant with other Overpass servers).
+ * Replication cadence is inferred from the configured base URL. Planet uses
+ * minute diffs; Geofabrik regional sources use daily diffs.
  */
 
 export type Env = Record<string, string | undefined>;
@@ -17,6 +15,10 @@ export interface ServerConfig {
   shardCacheMb: number;
   updateIntervalSeconds: number;
   updateBaseUrl: string;
+  updateKind: 'regional' | 'planet';
+  updateGranularity: 'minute' | 'day';
+  sourcePbf: string | null;
+  reextractSourcePbf: string | null;
   reextractEverySeconds: number;
   redisUrl: string | null;
   logVerbosity: 'errors' | 'info' | 'debug';
@@ -37,6 +39,9 @@ const readInt = (
   const value = Number(raw);
   if (!Number.isInteger(value)) {
     throw new Error(`${name} must be an integer, got: ${raw}`);
+  }
+  if (value <= 0) {
+    throw new Error(`${name} must be a positive integer, got: ${raw}`);
   }
   if (allowed && !allowed.includes(value)) {
     throw new Error(`${name} must be one of [${allowed.join(', ')}], got: ${value}`);
@@ -76,6 +81,10 @@ export const loadConfig = (env: Env = process.env): ServerConfig => {
 
   const redisUrlRaw = env.OSM_AMENITY_REDIS_URL;
 
+  const updateBaseUrl = (env.OSM_AMENITY_UPDATE_BASE_URL ?? 'https://planet.openstreetmap.org/replication')
+    .replace(/\/+$/, '');
+  const regional = /(?:^|\.)geofabrik\.de(?:\/|$)/i.test(new URL(updateBaseUrl).hostname);
+
   return {
     port: readInt(env, 'PORT', 8081),
     dataDir: env.OSM_AMENITY_DATA_DIR?.trim() ? env.OSM_AMENITY_DATA_DIR.trim() : '.',
@@ -83,8 +92,11 @@ export const loadConfig = (env: Env = process.env): ServerConfig => {
     shardPrecision: readInt(env, 'OSM_AMENITY_SHARD_PRECISION', 5, [3, 4, 5, 6, 7]),
     shardCacheMb: readInt(env, 'OSM_AMENITY_SHARD_CACHE_MB', 256),
     updateIntervalSeconds: readInt(env, 'OSM_AMENITY_UPDATE_INTERVAL_SECONDS', 3600),
-    updateBaseUrl: (env.OSM_AMENITY_UPDATE_BASE_URL ?? 'https://planet.openstreetmap.org/replication')
-      .replace(/\/+$/, ''),
+    updateBaseUrl,
+    updateKind: regional ? 'regional' : 'planet',
+    updateGranularity: regional ? 'day' : 'minute',
+    sourcePbf: env.OSM_AMENITY_SOURCE_PBF?.trim() || null,
+    reextractSourcePbf: env.OSM_AMENITY_REEXTRACT_SOURCE_PBF?.trim() || null,
     reextractEverySeconds: readInt(env, 'OSM_AMENITY_REEXTRACT_EVERY_SECONDS', 604800),
     redisUrl:
       redisUrlRaw && redisUrlRaw.trim().length > 0 ? redisUrlRaw.trim() : null,

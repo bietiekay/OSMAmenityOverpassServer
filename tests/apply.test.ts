@@ -43,14 +43,14 @@ describe('upsert/delete', () => {
     expect(upsertElement(shard, elem(1, 1))).toBe('added');
     expect(upsertElement(shard, elem(1, 2))).toBe('updated');
     expect(upsertElement(shard, elem(1, 1))).toBe('skipped');
-    expect(shard.elements.get(1)?.version).toBe(2);
+    expect(shard.elements.get('node:1')?.version).toBe(2);
   });
 
   it('replaces stored tags on update', () => {
     const shard: InMemoryShard = emptyShard();
     upsertElement(shard, elem(7, 1, 'toilets'));
     upsertElement(shard, elem(7, 2, 'parking'));
-    expect(shard.elements.get(7)?.tags).toEqual({ amenity: 'parking' });
+    expect(shard.elements.get('node:7')?.tags).toEqual({ amenity: 'parking' });
   });
 
   it('deletes only existing ids', () => {
@@ -59,6 +59,15 @@ describe('upsert/delete', () => {
     expect(deleteElement(shard, 1)).toBe(true);
     expect(deleteElement(shard, 1)).toBe(false);
     expect(shard.elements.size).toBe(0);
+  });
+
+  it('keeps equal numeric IDs for different OSM types distinct', () => {
+    const shard = emptyShard();
+    upsertElement(shard, elem(55, 1));
+    upsertElement(shard, { ...elem(55, 1), type: 'way' });
+    expect(shard.elements.size).toBe(2);
+    expect(shard.elements.get('node:55')?.type).toBe('node');
+    expect(shard.elements.get('way:55')?.type).toBe('way');
   });
 });
 

@@ -47,10 +47,13 @@ export interface ParsedAmenityQuery {
 const numberPattern = /-?\d+(?:\.\d+)?/g;
 
 const stripComments = (query: string): string =>
-  query.replace(/\/[/*].*?\*\//gs, '').replace(/--.*$/gm, '').replace(/#/gm, '');
+  query.replace(/\/\*.*?\*\//gs, '');
 
 const normaliseTuple = (tuple: string): BoundingBox | null => {
-  const matches = tuple.match(numberPattern);
+  const trimmed = tuple.trim();
+  const value = trimmed.startsWith('(') && trimmed.endsWith(')') ? trimmed.slice(1, -1) : trimmed;
+  if (!/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value)) return null;
+  const matches = value.match(numberPattern);
   if (!matches || matches.length !== 4) {
     return null;
   }
@@ -122,7 +125,7 @@ const hasForeignTagFilter = (cleaned: string): boolean => {
   return /\[\s*["']?[a-zA-Z_][\w:]*["']?\s*[=~]/.test(withoutAmenity);
 };
 
-const DIRECTIVE_PATTERN = /\[\s*(out|timeout|bbox|range|maxdate|mindate|adiff)\s*:[^\]]*\]/gi;
+const DIRECTIVE_PATTERN = /\[\s*(out|timeout|bbox|range|maxdate|mindate|adiff)\s*:[^\]]*\]\s*;?/gi;
 
 /**
  * Parse a query into the in-scope representation, or null (-> 501 out of scope).
@@ -132,6 +135,15 @@ export const parseAmenityQuery = (query: string): ParsedAmenityQuery | null => {
   if (cleaned.length === 0) {
     return null;
   }
+
+  const directives = [...cleaned.matchAll(/\[\s*([a-z]+)\s*:\s*([^\]]*)\]/gi)];
+  if (directives.some(([, name, value]) => {
+    const key = name.toLowerCase();
+    const directiveValue = value.trim().toLowerCase();
+    return key === 'out'
+      ? directiveValue !== 'json' && directiveValue !== 'xml'
+      : key !== 'timeout' || !/^\d+$/.test(directiveValue);
+  })) return null;
 
   const output: OutputFormat = /\bout\s*:\s*json/i.test(cleaned) ? 'json' : 'xml';
   const bbox = extractBbox(cleaned);
@@ -147,8 +159,14 @@ export const parseAmenityQuery = (query: string): ParsedAmenityQuery | null => {
   SET_COMMAND_PATTERN.lastIndex = 0;
   let match: RegExpExecArray | null;
   let foundSetCommand = false;
+  let setStart = Number.POSITIVE_INFINITY;
+  let setEnd = -1;
+  const setMatches: Array<{ start: number; end: number }> = [];
   while ((match = SET_COMMAND_PATTERN.exec(withoutDirectives)) !== null) {
     foundSetCommand = true;
+    setStart = Math.min(setStart, match.index);
+    setEnd = Math.max(setEnd, match.index + match[0].length);
+    setMatches.push({ start: match.index, end: match.index + match[0].length });
     const rawValue = match[2] ?? match[3] ?? match[4] ?? '';
     const value = normalizeAmenityValue(rawValue);
     if (value.length === 0) {
@@ -178,6 +196,33 @@ export const parseAmenityQuery = (query: string): ParsedAmenityQuery | null => {
   }
 
   const includeMembers = /(^|;)\s*>\s*;/m.test(cleaned);
+  if (clauses.length !== (includeMembers ? 2 : 1)) return null;
+  if ((cleaned.match(/\s*>\s*;/g) ?? []).length !== (includeMembers ? 1 : 0)) return null;
+
+  const outMatches = [...withoutDirectives.matchAll(/\bout\s*(?:body|skel|tags|geom)?(?:\s+(?:meta|qt))*\s*;/gi)];
+  if (outMatches.length !== clauses.length || !outMatches[0].index || setEnd > outMatches[0].index) return null;
+  const prefix = withoutDirectives.slice(0, setStart);
+  const selectorTail = withoutDirectives.slice(setEnd, outMatches[0].index);
+  const wrapped = /^\s*\(\s*$/.test(prefix) && /^\s*;?\s*\)\s*;?\s*$/.test(selectorTail);
+  if (!/^\s*(?:\(\s*)?$/.test(prefix) || !/^\s*;?\s*\)?\s*;?\s*$/.test(selectorTail)) return null;
+  if (setMatches.length > 1 && !wrapped) return null;
+  const firstOutEnd = outMatches[0].index + outMatches[0][0].length;
+  if (includeMembers) {
+    const secondOutStart = outMatches[1].index as number;
+    if (!/^\s*>\s*;\s*$/.test(withoutDirectives.slice(firstOutEnd, secondOutStart))) return null;
+  } else if (!/^\s*$/.test(withoutDirectives.slice(firstOutEnd))) {
+    return null;
+  }
+
+  // Consume only the deliberately supported QL statements. Regex extraction
+  // alone is unsafe: it used to accept valid-looking queries with extra
+  // unions, filters, recurse operators, or output commands hidden between them.
+  const remainder = withoutDirectives
+    .replace(SET_COMMAND_PATTERN, ' ')
+    .replace(/\bout\s*(?:body|skel|tags|geom)?(?:\s+(?:meta|qt))*\s*;/gi, ' ')
+    .replace(/\s*>\s*;/g, ' ')
+    .replace(/[();\s]+/g, '');
+  if (remainder.length > 0) return null;
 
   return {
     amenity: amenityValues.values().next().value as string,

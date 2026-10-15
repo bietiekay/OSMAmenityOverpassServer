@@ -12,6 +12,7 @@ describe('isValidBoundingBox', () => {
     expect(isValidBoundingBox(35.1, 135.0, 35.0, 135.1)).toBe(false);
     expect(isValidBoundingBox(35.0, 135.0, 35.0, 135.1)).toBe(false);
     expect(isValidBoundingBox(NaN, 135.0, 35.1, 135.1)).toBe(false);
+    expect(isValidBoundingBox(91, 0, 92, 1)).toBe(false);
   });
 });
 
@@ -58,5 +59,11 @@ describe('cellsIntersectingBbox', () => {
 
   it('returns an empty list for an invalid box', () => {
     expect(cellsIntersectingBbox(51.2, 10.0, 51.0, 10.2, 5)).toEqual([]);
+  });
+
+  it('supports zero-area way extents and caps huge requests', () => {
+    const cells = cellsIntersectingBbox(0, 0, 0, 0, 5);
+    expect(cells).toContain(ngeohash.encode(0, 0, 5));
+    expect(() => bboxToCells({ south: -90, west: -180, north: 90, east: 180 }, 7)).toThrow(/too many/);
   });
 });

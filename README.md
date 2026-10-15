@@ -1,194 +1,191 @@
 # OSMAmenityOverpassServer
 
-A standalone, self-updating, **Overpass-compatible amenity data server** with a
-geohash-sharded on-disk index. It serves worldwide OSM amenity data (starting
-with `amenity=toilets`) and is designed to be consumed by
-[Overpass-Proxy](../Overpass-Proxy) **without any modification of the proxy** —
-integration happens purely via the proxy's `UPSTREAM_URLS` configuration.
+A local OSM amenity index serving the narrow Overpass QL subset used by
+Overpass-Proxy. In-scope requests are answered from geohash shards; unsupported
+requests return `501 {"error":"out of scope"}` so the unmodified proxy can
+fall through to its next upstream. This repository targets full-planet builds
+and has been exercised with Japan data; a planet-scale run is not claimed here.
 
-```
- ToileFinder app ──▶ Overpass-Proxy ──▶ OSMAmenityOverpassServer (this repo)
-                        │  UPSTREAM_URLS ──▶  /api/interpreter on port 8081
-                        └───────────────────▶  remote Overpass pool (failover)
-```
+## Documentation
 
-Out-of-scope queries (other amenity values, non-amenity tags, non-tile shapes)
-answer `501 {"error":"out of scope"}` so the proxy fails over to the remote
-pool transparently.
+- [Installation, commissioning, and operations](docs/OPERATIONS.md): native
+  Linux setup, source download, extraction, systemd, proxy integration, Docker,
+  updates, monitoring, backup, rollback, and troubleshooting.
+- [Architecture and implementation](docs/ARCHITECTURE.md): module map, data
+  flow, generation transactions, formats, budgets, and tests.
+- [API and storage specification](specification.md).
+- [Verified acceptance results](plans/2026-10-15-abnahme.md) and
+  [current status](plans/TODO.md).
+- [Implementation brief](plans/ZIEL-PROMPT.md) and
+  [historical design decisions](plans/2026-10-14-osm-amenity-overpass-server.md).
 
-## Why this exists
+All documentation is in English. Some dated planning filenames are retained
+to preserve existing links. Local verification datasets and logs mentioned in
+the acceptance report are external artifacts, not repository contents.
 
-The proxy in front of the ToiletFinder app needs a *local, always-available,
-low-latency* source for the one query shape it actually generates (the
-geohash-tile amenity query). A full Overpass instance is expensive to run and
-to keep fresh; this server stores exactly the pre-configured amenity values,
-serves them from a geohash shard index (one proxy tile = one shard), and keeps
-itself up to date with OSM minute replication diffs — with minimal recurring
-work.
-
-## Repository layout
-
-```
-OSMAmenityOverpassServer/
-├── src/
-│   ├── index.ts               # entry point: config -> engine -> server
-│   ├── config.ts              # OSM_AMENITY_* env config
-│   ├── server.ts              # Fastify app: interpreter/status/timestamp/kill
-│   ├── query.ts               # in-scope QL subset parser (tile query shape)
-│   ├── output.ts              # Overpass JSON/XML renderers + ETag
-│   ├── replication.ts         # minute replication state/URL/catch-up helpers
-│   ├── stats.ts               # latency p50/p95, cache hit/miss, errors
-│   ├── logger.ts              # pino wrapper
-│   └── index/
-│       ├── geohash.ts         # bbox <-> geohash cell math (precision 5)
-│       ├── shard.ts           # OAM1 binary shard writer/reader/verifier
-│       ├── engine.ts          # query engine + shard LRU byte cache
-│       └── apply.ts           # minute-diff apply decisions (upsert/delete)
-├── scripts/
-│   ├── extract.mjs            # planet extraction pipeline (stage 0 + stubs)
-│   └── make-fixture.mjs       # synthetic planet for tests / stage-0 verify
-├── tests/                     # vitest (unit + integration), 80 tests
-├── Dockerfile                 # 2-stage build (node:20-alpine)
-├── docker-compose.yml.template
-├── LICENSE                    # same license as Overpass-Proxy
-├── specification.md           # wire contracts + data formats (OAM1, status, ...)
-└── OSMAmenityOverpassServer-Prompt.md  # project prompt (self-contained spec)
-```
-
-## Requirements
-
-- Node.js >= 20 (tested with 22.x)
-- For planet extraction only: `osmium-tool` (>= 1.14) for PBF conversion and
-  object-count verification. The server itself has **no native dependencies**.
-
-## Quick start (fixture)
+## Run the server
 
 ```bash
-npm install
+npm ci
 npm run build
-
-# generate a synthetic planet and validate stage 0 (block split + counts)
-npm run make-fixture -- --out-dir fixtures --verify
-
-# run the server against the fixture data dir
-OSM_AMENITY_DATA_DIR=fixtures/data npm start
+OSM_AMENITY_DATA_DIR=/path/to/pipeline/data npm start
 ```
 
-## Planet pipeline (one-time + periodic re-extract)
+Set `OSM_AMENITY_UPDATE_BASE_URL` to the exact namespace recorded in the
+generation's `state.json`. For Japan this is normally
+`https://download.geofabrik.de/asia/japan-updates`; the default planet feed
+does not match a regional baseline. See the commissioning guide before starting
+an installation for the first time.
 
-Measured 2026-10-14: planet.openstreetmap.org no longer serves PBF; the
-download is `planet-latest.osm.bz2` (~167 GB), converted locally with osmium:
+The data directory must be a published generation containing `manifest.json`,
+`state.json`, and `shards/`. A valid empty generation has an explicit empty
+`manifest.shards` array. A missing or invalid generation fails interpreter
+requests instead of returning a misleading empty success.
 
-```bash
-# 1) download (resumable)
-curl -fSL --retry 10 --retry-delay 10 --retry-all-errors -C - \
-  -o /ssdbuffer/osm-amenity/planet/planet-latest.osm.bz2 \
-  https://planet.openstreetmap.org/planet/planet-latest.osm.bz2
-
-# 2) verify md5 (published on the planet page)
-md5sum /ssdbuffer/osm-amenity/planet/planet-latest.osm.bz2
-
-# 3) convert to PBF (output on the /home volume, ~89 GB)
-osmium cat /ssdbuffer/osm-amenity/planet/planet-latest.osm.bz2 \
-  -o /home/.../data/planet-latest.osm.pbf --overwrite
-
-# 4) stage 0: block split into work chunks (byte copy, parallel, resumable)
-node scripts/extract.mjs \
-  --planet-source /home/.../data/planet-latest.osm.pbf \
-  --data-dir /ssdbuffer/osm-amenity/data \
-  --stages 0 --chunk-mb 1024 --verify
-```
-
-Disk placement (measured on the target machine):
-
-| Volume | Free | Usage |
-|---|---|---|
-| `/home` | ~133 GB | PBF (~89 GB) + final shard data (~5 GB) |
-| `/ssdbuffer` | ~183 GB | bz2 during download (peak 167 GB), then work/ + chunks (~90 GB) |
-| `/hauswolke` | ~163 GB | overflow only |
-
-## Configuration (environment)
+## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8081` | Listen port (proxy tile queries arrive here) |
-| `OSM_AMENITY_DATA_DIR` | `.` | Shard + `state.json` directory |
-| `OSM_AMENITY_AMENITIES` | `toilets` | Comma-separated amenity values to serve |
-| `OSM_AMENITY_SHARD_PRECISION` | `5` | Geohash precision (3–7); 5 = proxy tile size |
-| `OSM_AMENITY_SHARD_CACHE_MB` | `256` | Shard LRU byte-cache size |
-| `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Catch-up loop wake interval |
-| `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Minute replication base URL |
-| `OSM_AMENITY_REEXTRACT_EVERY_SECONDS` | `604800` | Drift-guard: full re-extract period (weekly) |
-| `OSM_AMENITY_REDIS_URL` | — | Optional (Phase 2: direct tile invalidation via proxy Redis) |
-| `LOG_VERBOSITY` | `info` | `errors` \| `info` \| `debug` |
+| `PORT` | `8081` | HTTP listen port |
+| `OSM_AMENITY_DATA_DIR` | `.` | Active generation directory (often pipeline `data/` symlink) |
+| `OSM_AMENITY_AMENITIES` | `toilets` | Comma-separated configured amenity values |
+| `OSM_AMENITY_SHARD_PRECISION` | `5` | Geohash precision, 3 through 7 |
+| `OSM_AMENITY_SHARD_CACHE_MB` | `256` | In-memory shard LRU limit |
+| `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Update-loop wake cadence |
+| `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Replication namespace root; Geofabrik host implies regional/day, otherwise planet/minute |
+| `OSM_AMENITY_SOURCE_PBF` | unset | Optional retained PBF path for updater re-extract; mounted path can differ from the source path recorded at build |
+| `OSM_AMENITY_REEXTRACT_SOURCE_PBF` | unset | Optional PBF used only for weekly drift re-extracts; falls back to `OSM_AMENITY_SOURCE_PBF` |
+| `OSM_AMENITY_REEXTRACT_EVERY_SECONDS` | `604800` | Drift-guard interval (one week by default) |
+| `OSM_AMENITY_REDIS_URL` | unset | Reserved setting; direct proxy Redis invalidation is not implemented |
+| `OSM_AMENITY_REDIS_INVALIDATE` | `false` | Reserved Redis invalidation toggle; only read when Redis is configured |
+| `LOG_VERBOSITY` | `info` | `errors`, `info`, or `debug` |
+
+The active generation's persisted replication descriptor is authoritative for
+its local cursor. `osm_osm_change` is populated only for a known planet/minute
+cursor; regional daily sequence numbers are reported in `localEngine` and never
+misrepresented as global minute values.
 
 ## Endpoints
 
-| Endpoint | Behaviour |
-|---|---|
-| `POST/GET /api/interpreter` | In-scope tile query (form field `data`) → 200 with Overpass JSON/XML + `ETag`. Out of scope → `501 {"error":"out of scope"}`. Missing/blank `data` → `400 {"error":"missing query in form field \"data\""}`. |
-| `GET /api/status` | Conformant Overpass status block (`version`, `osm_osm_change`, `time_used`, `memory_used`, `output_format`) plus a `localEngine` extension (shards, elements, lastSeq, stats, ...) for external monitoring. |
-| `GET /api/timestamp` | Data-sequence timestamp (text/plain; falls back to now). |
-| `POST /api/kill_my_queries` | 200 no-op (no local query queue). |
-| `HEAD /` (base URL) | 2xx — answers the proxy's upstream recovery probe. |
+- `POST` and `GET /api/interpreter`: reads form or query parameter `data`. A
+  supported query returns Overpass JSON/XML and a stable `ETag`; unsupported
+  syntax returns 501; a blank query returns 400.
+- `GET /api/status`: Overpass monitoring fields plus local generation, cursor,
+  configuration, and query statistics.
+- `GET /api/timestamp`: generation data timestamp, or an empty string when
+  unknown.
+- `POST /api/kill_my_queries`: successful no-op (there is no queued query work).
+- `HEAD /` and `HEAD /api/interpreter`: successful recovery probes.
 
-`osm_osm_change` is the **minute replication sequence number** of the applied
-data — the canonical freshness field of other Overpass servers. An external
-monitor compares it against the live `minute/state.txt` `sequenceNumber`.
-See [specification.md](specification.md) for full contracts.
+The parser accepts a constrained amenity equality + common bbox query, optional
+`node`/`way`/`relation` selectors, one supported output clause and optional
+`>;` member expansion. Unknown filters/directives/leftover QL are out of scope.
+See [specification.md](specification.md) for response and storage semantics.
 
-## Proxy integration
+## Build the index
 
-The proxy stays unmodified; it just gains this server as one of its upstreams:
-
-```env
-UPSTREAM_URLS=http://amenity-server:8081/api/interpreter,https://overpass.kumi.systems/api/interpreter
-```
-
-The proxy retries this upstream on 403/408/413/5xx and probes availability
-with `HEAD` on the base URL; the `501 out of scope` answer is *not* retried
-and triggers failover to the next upstream.
-
-## Self-update loop
-
-- Source: OSM **minute** replication files (`minute/NNN/NNN/NNN.osc.gz`),
-  always — the canonical cursor is the minute sequence number.
-- The loop wakes every `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` (default hourly),
-  reads `minute/state.txt`, and applies every missing minute file to the
-  affected geohash shards (affected cells only; shard cache invalidated
-  post-update).
-- Hour/day file catch-up is a documented future optimization (the counters
-  are not interconvertible — minute sequence stays the canonical cursor).
-- A full re-extract runs every `OSM_AMENITY_REEXTRACT_EVERY_SECONDS`
-  (default: weekly) as a drift guard against accumulated apply errors.
-
-## Tests & verification
+`--data-dir` is the pipeline root. The working data is under `work/`; the
+published server generation is under `data/`. Stage 0 accepts `--source` (with
+`--planet-source` as an alias); stages 1–3 extract amenities and resolve way
+and node references; stage 4 assembles and atomically publishes OAM shards.
 
 ```bash
-npm run lint      # eslint (src/**/*.ts)
-npm run build     # tsc (strict, NodeNext)
-npm test          # vitest run — 10 files, 80 tests
-npm run verify    # lint + build + test (one command)
-npm run test:ci   # vitest with coverage gate (lines >= 90%, branches >= 85%)
+node scripts/extract.mjs \
+  --source /path/to/region.osm.pbf \
+  --data-dir /path/to/pipeline \
+  --stages 0-4 \
+  --chunk-mb 256 --ram-mb 8192 --worker-ram-mb 2048 --workers 3 \
+  --all-amenity-values true --verify
 ```
 
-Stage-0 pipeline verification:
+Supported extraction options are `--source`/`--planet-source`, `--data-dir`,
+`--stages` (`0`, a stage, or range such as `0-4`), `--chunk-mb`, `--ram-mb`,
+`--worker-ram-mb`, `--workers`, `--shard-precision`, `--keep-chunks`,
+`--all-amenity-values`, `--amenities`, and `--verify`. Extraction requires
+`osmium-tool`; run `node scripts/extract.mjs` with no stage source to resume a
+previously recorded stage from `work/manifest.json`. Specify the intended
+`--stages` and `--data-dir`; the CLI defaults to stage 0, which requires a source.
+
+A reusable live HTTP smoke verifier is available after starting a local server:
 
 ```bash
-npm run make-fixture -- --out-dir fixtures --verify
-# -> fixture planet: osmium object counts of the chunk files must equal
-#    the counts of the fixture planet file (VERIFY OK)
+node scripts/verify-http.mjs \
+  --url http://127.0.0.1:8081 \
+  --expected-nodes /path/to/tokyo-expected-nodes.json
 ```
 
-## Known limitations / open items
+It checks real HTTP GET/POST JSON, XML, stable ETags, expected node records,
+400/501 behavior, status, kill no-op, and HEAD probes. Without the expected
+file it uses a bounded Tokyo-area smoke bbox.
 
-- Stages 1–3 of the extraction pipeline (amenity extraction, member merge,
-  shard assembly) are implemented against the OAM1 format in `src/index/` and
-  validated on fixtures; the full-planet run executes after the planet
-  download + conversion (see pipeline above).
-- Minute-diff *apply* (osmchange parsing) is the Phase-2 item; the pure
-  helpers (state parse, URL build, catch-up list, apply decisions) are
-  complete and tested.
-- Cache TTL starts at 24 h and is stepped down based on measured
-  local-source performance (plan §9).
-- Public Overpass parity checks must run on a networked machine.
+To compare a saved QL query against public Overpass by typed object identity
+and complete element fields (ignoring response order), run:
+
+```bash
+npm run parity -- --local-url http://127.0.0.1:8081/api/interpreter \
+  --reference-url https://overpass-api.de/api/interpreter \
+  --query-file query.ql
+```
+
+The report includes source timestamps as diagnostics. A mismatch or HTTP error
+exits nonzero; public endpoint availability is not guaranteed.
+
+## Replication and current limits
+
+The updater reads a namespace-local replication cursor and applies contiguous
+minute/day diffs through immutable generations. Weekly drift rebuilds run stages
+0–4 into an inactive generation, reject unknown or mismatched snapshot cursors,
+replay the configured namespace through the current live cursor under the
+generation lock, then activate atomically. If no successful re-extract time is
+recorded yet, the first scheduled check establishes the weekly timer baseline
+instead of rebuilding immediately. A separate
+`OSM_AMENITY_REEXTRACT_SOURCE_PBF` may provide a newer source snapshot; when it
+is unset, the updater reuses `OSM_AMENITY_SOURCE_PBF`, then the active
+generation's recorded source path. The update watch loop
+checks the weekly schedule after each catch-up cycle. These mechanisms still
+do not prove public Overpass parity, crash recovery in every failure mode, or
+planet-scale resource bounds. Regional Geofabrik inputs use their own daily
+namespace and sequence.
+
+The line pipeline is partitioned and bounded in its lookups, but Japan success
+does not demonstrate planet-size runtime or resource bounds. Relations currently
+have aggregate bounds and direct member expansion; nested relation closure and
+full public Overpass parity remain limited.
+
+Each update batch hardlinks the generation tree and scans its shard inventory
+for validation and an exact recount. Publication also syncs the generation tree.
+This work scales with the complete index, even when few shards change. Dependency
+closure is capped at 50,000 tracked objects, affected cells at 5,000, rebuilt rows
+at 64 MiB, and each resolved-object lookup at 64 MiB. The shared geometry
+member-object cache has no aggregate byte cap; total updater RAM is not bounded
+by that per-lookup limit. A batch exceeding a checked limit
+fails without advancing the cursor; reduce the update interval or use a newer
+baseline. These checks do not establish planet memory bounds or throughput.
+Retain the baseline PBF unchanged while it serves updates; provide a newer
+snapshot through a separate re-extract path. Old immutable generations currently
+require operator-managed retention and disk capacity.
+
+## Docker packaging
+
+The runner uses `node:22-bookworm-slim` and installs Debian's `osmium-tool`,
+`coreutils`, `util-linux` (for `flock`), and `gawk` because the update/re-extract pipeline runs offline
+inside the container. The prior Alpine runtime did not include an available
+`osmium-tool` package. The pipeline root is a writable `/osm` volume; the active
+server data path is `/osm/data`, and the retained PBF is mounted read-only at
+`/source/region.osm.pbf` through `OSM_AMENITY_SOURCE_PBF`. See
+`docker-compose.yml.template` for required host path variables.
+
+Docker packaging has not been built or tested locally and is not part of the
+current verification result.
+
+## Development checks
+
+```bash
+npm run lint
+npm run build
+npm test
+npm run test:ci
+```
+
+`test:ci` enforces 90% statements, 85% branches, 90% functions, and 90% lines
+across TypeScript server code, extraction modules, and updater modules.

@@ -12,9 +12,8 @@
  *   POST     /api/kill_my_queries  200 no-op (no local query queue)
  *   HEAD     on base URL         2xx (upstream recovery probe, plan §17)
  *
- * osm_osm_change is the minute replication sequence of the applied data -
- * the canonical freshness field used by other Overpass implementations, so an
- * external monitor compares it against the live minute/state.txt sequence.
+ * osm_osm_change is populated only for a persisted planet/minute cursor.
+ * Regional daily sequences are exposed separately as localEngine metadata.
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -34,16 +33,30 @@ export interface DataState {
   lastUpdate: string | null;
   /** Data-sequence timestamp for /api/timestamp and the osm3s block. */
   dataTimestamp: string | null;
+  replication: {
+    baseUrl: string | null;
+    kind: 'regional' | 'planet' | null;
+    interval: 'minute' | 'day' | null;
+    sequenceNumber: number | null;
+    originalMinuteSeq: number | null;
+  } | null;
 }
 
 export const readDataState = async (dataDir: string): Promise<DataState> => {
-  const fallback: DataState = { lastSeq: null, lastUpdate: null, dataTimestamp: null };
+  const fallback: DataState = { lastSeq: null, lastUpdate: null, dataTimestamp: null, replication: null };
   try {
     const raw = await fs.readFile(path.join(dataDir, 'state.json'), 'utf8');
     const parsed = JSON.parse(raw) as {
       lastSeq?: number;
       lastUpdate?: string;
       dataTimestamp?: string;
+      replication?: {
+        baseUrl?: unknown;
+        kind?: unknown;
+        interval?: unknown;
+        sequenceNumber?: unknown;
+        originalMinuteSeq?: unknown;
+      };
     };
     const lastSeqRaw = parsed.lastSeq;
     const lastSeq = typeof lastSeqRaw === 'number' && Number.isInteger(lastSeqRaw) ? lastSeqRaw : null;
@@ -51,7 +64,18 @@ export const readDataState = async (dataDir: string): Promise<DataState> => {
       lastSeq,
       lastUpdate: typeof parsed.lastUpdate === 'string' ? parsed.lastUpdate : null,
       dataTimestamp:
-        typeof parsed.dataTimestamp === 'string' ? parsed.dataTimestamp : null
+        typeof parsed.dataTimestamp === 'string' ? parsed.dataTimestamp : null,
+      replication: parsed.replication ? {
+        baseUrl: typeof parsed.replication.baseUrl === 'string' ? parsed.replication.baseUrl : null,
+        kind: parsed.replication.kind === 'regional' || parsed.replication.kind === 'planet'
+          ? parsed.replication.kind : null,
+        interval: parsed.replication.interval === 'minute' || parsed.replication.interval === 'day'
+          ? parsed.replication.interval : null,
+        sequenceNumber: typeof parsed.replication.sequenceNumber === 'number' &&
+          Number.isSafeInteger(parsed.replication.sequenceNumber) ? parsed.replication.sequenceNumber : null,
+        originalMinuteSeq: typeof parsed.replication.originalMinuteSeq === 'number' &&
+          Number.isSafeInteger(parsed.replication.originalMinuteSeq) ? parsed.replication.originalMinuteSeq : null
+      } : null
     };
   } catch {
     return fallback;
@@ -69,6 +93,7 @@ export interface ServerDeps {
 export const buildServer = (deps: ServerDeps): Promise<FastifyInstance> => {
   const { config, engine, stats, logger, serverVersion } = deps;
   const app = Fastify({ logger: false });
+  engine.configureAmenities(config.amenities);
 
   void app.register(formbody);
 
@@ -78,8 +103,11 @@ export const buildServer = (deps: ServerDeps): Promise<FastifyInstance> => {
     request: FastifyRequest<{ Body: { data?: string; [key: string]: unknown } }>,
     reply: FastifyReply
   ): Promise<unknown> => {
+    if (request.method === 'HEAD') return reply.code(200).send();
     const body = request.body;
-    const data = typeof body === 'string' ? body : typeof body?.data === 'string' ? body.data : null;
+    const queryValue = request.query as Record<string, unknown> | undefined;
+    const data = typeof body === 'string' ? body : typeof body?.data === 'string'
+      ? body.data : typeof queryValue?.data === 'string' ? queryValue.data : null;
     if (typeof data !== 'string' || data.trim().length === 0) {
       return reply.code(400).type('application/json').send({ error: 'missing query in form field "data"' });
     }
@@ -114,11 +142,12 @@ export const buildServer = (deps: ServerDeps): Promise<FastifyInstance> => {
     const shardCount = await engine.countShards();
     const elementCount = await engine.countElements();
 
-    // Conformant Overpass status block (external monitoring reads
-    // osm_osm_change; compare it against the live minute/state.txt sequence).
+    // Only a known planet/minute cursor is comparable to global Overpass
+    // osm_osm_change; regional daily cursors are exposed in localEngine below.
     const conformant = {
       version: serverVersion,
-      osm_osm_change: state.lastSeq === null ? '0' : String(state.lastSeq),
+      osm_osm_change: state.replication?.kind === 'planet' && state.replication.interval === 'minute' &&
+        state.replication.sequenceNumber !== null ? String(state.replication.sequenceNumber) : '0',
       time_used: 0.0,
       memory_used: process.memoryUsage().rss,
       output_format: 'JSON'
@@ -134,7 +163,10 @@ export const buildServer = (deps: ServerDeps): Promise<FastifyInstance> => {
       lastUpdate: state.lastUpdate,
       dataTimestamp: state.dataTimestamp,
       updateIntervalSeconds: config.updateIntervalSeconds,
-      updateBaseUrl: config.updateBaseUrl,
+      updateBaseUrl: state.replication?.baseUrl ?? config.updateBaseUrl,
+      updateKind: state.replication?.kind ?? config.updateKind,
+      updateGranularity: state.replication?.interval ?? config.updateGranularity,
+      replication: state.replication,
       stats: stats.snapshot(engine.cacheHits, engine.cacheMisses)
     };
 
@@ -143,9 +175,7 @@ export const buildServer = (deps: ServerDeps): Promise<FastifyInstance> => {
 
   app.get('/api/timestamp', async (_request, reply) => {
     const state = await dataState();
-    return reply
-      .type('text/plain')
-      .send(state.dataTimestamp ?? new Date().toISOString());
+    return reply.type('text/plain').send(state.dataTimestamp ?? '');
   });
 
   app.post('/api/kill_my_queries', (_request, reply) => {
