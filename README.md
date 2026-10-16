@@ -8,6 +8,9 @@ and has been exercised with Japan data; a planet-scale run is not claimed here.
 
 ## Documentation
 
+- [Easy planet setup with Docker Compose](easy-setup.md): step-by-step root-server
+  deployment, an interactive [setup wizard](scripts/easy-setup.sh), initial planet
+  import, and Overpass-Proxy integration without systemd.
 - [Installation, commissioning, and operations](docs/OPERATIONS.md): native
   Linux setup, source download, extraction, systemd, proxy integration, Docker,
   updates, monitoring, backup, rollback, and troubleshooting.
