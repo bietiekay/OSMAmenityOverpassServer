@@ -238,7 +238,10 @@ else
   max_workers=$(((ram_mb - 512) / worker_mb))
   default_workers=3; (( max_workers >= 3 )) || default_workers=$max_workers
   ask_int workers 'Maximum extraction workers' "$default_workers" 1 "$max_workers"
-  all_values=false; confirm 'Retain all amenity values in intermediate data?' no && all_values=true
+  printf 'This controls temporary import data, not which values the server answers today. Yes keeps objects tagged with any amenity value\n'
+  printf 'so you can build another served amenity set later without repeating the PBF scan; it uses more disk. No keeps only\n'
+  printf 'the values selected above and saves space, but adding values later requires rerunning the import from the PBF.\n'
+  all_values=false; confirm 'Keep every amenity value in temporary import data?' no && all_values=true
   keep_chunks=false; confirm 'Keep PBF chunks for resuming?' yes && keep_chunks=true
   verify=false; confirm 'Verify source/chunk object counts (extra full scans; retains chunks)?' yes && verify=true
   validate_settings

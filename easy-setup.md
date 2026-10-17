@@ -47,6 +47,14 @@ The wizard asks for:
 - Initial extraction RAM/worker/chunk budgets, retention of intermediate amenity
   values and chunks, and source/chunk verification.
 
+“Keep every amenity value” applies to temporary extraction data. **Yes** keeps
+OSM objects with any `amenity=*` tag, which uses more disk and lets you build a
+different served amenity set later without scanning the PBF again. **No** keeps
+only the values selected for this setup (for example, `toilets`) and saves
+space; serving a new value later requires rerunning extraction from the PBF.
+Either choice serves only the amenity values configured for the active index
+and server. It does not turn on every amenity automatically.
+
 ### Storage and disk space
 
 The three paths have different jobs:
