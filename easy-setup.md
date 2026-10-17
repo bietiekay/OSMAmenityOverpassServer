@@ -301,13 +301,12 @@ services:
         max-file: "5"
     networks:
       default: {}
-      overpass:
+      osm-overpass:
         aliases:
           - osm-amenity
 networks:
-  overpass:
+  osm-overpass:
     external: true
-    name: osm-overpass
 YAML
 
 dc config
@@ -481,12 +480,14 @@ services:
       UPSTREAM_URLS: "http://osm-amenity:8081/api/interpreter,https://overpass-api.de/api/interpreter"
     networks:
       - default
-      - overpass
+      - osm-overpass
 networks:
-  overpass:
+  osm-overpass:
     external: true
-    name: osm-overpass
 ```
+
+If the proxy is in a separate Compose project, also add `osm-overpass` to its
+`proxy` service's network list, alongside `default` as shown above.
 
 Merge these keys into the existing file; do not replace the whole proxy stack
 with this fragment. Recreate the proxy **from its own Compose directory**:

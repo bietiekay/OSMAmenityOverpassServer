@@ -295,12 +295,11 @@ services:
         max-file: '5'
     networks:
       default: {}
-      overpass:
+      $network:
         aliases: ['$dns_name']
 networks:
-  overpass:
+  $network:
     external: true
-    name: '$network'
 YAML
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\n'
@@ -313,7 +312,7 @@ YAML
     printf '# Merge into the existing proxy Compose file; do not replace the stack.\n'
     printf 'services:\n  %s:\n    environment:\n      UPSTREAM_URLS: "%s"\n' "$proxy_service" "$upstreams"
     if [[ $proxy_mode == docker ]]; then
-      printf '    networks: [default, overpass]\nnetworks:\n  overpass:\n    external: true\n    name: "%s"\n' "$network"
+      printf '    networks: [default, %s]\nnetworks:\n  %s:\n    external: true\n' "$network" "$network"
     fi
   } > "$deployment/proxy.compose.example.yml"
 fi
