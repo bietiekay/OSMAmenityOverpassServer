@@ -6,6 +6,7 @@ import { createPartitionedLookup, readLines, countUniqueRecords, partitionCountF
 import { pointToCell, cellsIntersectingBbox } from '../../dist/index/geohash.js';
 import { buildConfigHash, writeShard, readShard } from '../../dist/index/shard.js';
 import { withGenerationLock, activateGeneration } from '../update/generation.mjs';
+import { createProgress } from './progress.mjs';
 
 const filesIn = async (dir, re) => {
   try { return (await fs.readdir(dir)).filter((f) => re.test(f)).sort().map((f) => path.join(dir, f)); }
@@ -42,7 +43,7 @@ export async function buildIndex(options) {
   if (!input.amenities.length) throw new Error('Stage 4 requires amen_c*.lines inputs');
   const { decodeElement } = await import('./lines.mjs');
   const sourcePbf = source ? path.resolve(source) : null;
-  const fingerprint = await indexFingerprint(input, { source: sourcePbf, sourceFingerprint: options.sourceFingerprint ?? null, amenities, shardPrecision });
+  const fingerprint = await indexFingerprint(input, { source: sourcePbf, sourceFingerprint: options.sourceFingerprint ?? null, amenities, shardPrecision, logger: options.logger });
   const configHash = buildConfigHash({ amenities, precision: shardPrecision });
   // Identical, fully validated active generations are safe to reuse. Never
   // resume by writing into an active generation; an incomplete match is rebuilt
@@ -76,19 +77,27 @@ export async function buildIndex(options) {
   const generation = path.join(generations, generationId);
   await fs.mkdir(path.join(generation, 'shards'), { recursive: true });
   const nodeRecords = async function* () {
+    const total = await totalFileBytes(input.nodes); let completed = 0;
+    const progress = createProgress('stage 4 node lookup', total, options.logger ?? console.log);
     for await (const line of readLines(input.nodes)) {
+      completed += Buffer.byteLength(line) + 1; progress(completed, completed >= total);
       const o = decodeElement(line);
       if (o.type === 'node') yield { key: o.id, value: o };
     }
+    progress(total, true);
   };
   const lookupBudget = Math.max(32, Math.min(512, Math.floor(ramMB * 0.1))) * 1024 * 1024;
   const nodeBytes = await totalFileBytes(input.nodes);
   const nodes = await createPartitionedLookup(generation, 'objects/nodes', nodeRecords(), { partitions: partitionCountForBytes(nodeBytes * 2), maxCacheBytes: lookupBudget, maxPartitionBytes: 4 * 1024 * 1024 });
   const wayRecords = async function* () {
+    const total = await totalFileBytes(input.ways); let completed = 0;
+    const progress = createProgress('stage 4 way lookup', total, options.logger ?? console.log);
     for await (const line of readLines(input.ways)) {
+      completed += Buffer.byteLength(line) + 1; progress(completed, completed >= total);
       const o = decodeElement(line);
       if (o.type === 'way') yield { key: o.id, value: o };
     }
+    progress(total, true);
   };
   const wayBytes = await totalFileBytes(input.ways);
   const ways = await createPartitionedLookup(generation, 'objects/ways', wayRecords(), { partitions: partitionCountForBytes(wayBytes * 2), maxCacheBytes: lookupBudget, maxPartitionBytes: 4 * 1024 * 1024 });
@@ -107,7 +116,10 @@ export async function buildIndex(options) {
   let missingCount = 0;
   let firstMissing = null;
   const noteMissing = (description) => { missingCount++; firstMissing ??= description; };
+  const amenityBytes = await totalFileBytes(input.amenities); let amenityBytesRead = 0;
+  const amenityProgress = createProgress('stage 4 amenity mapping', amenityBytes, options.logger ?? console.log);
   for await (const line of readLines(input.amenities)) {
+    amenityBytesRead += Buffer.byteLength(line) + 1; amenityProgress(amenityBytesRead, amenityBytesRead >= amenityBytes);
     const o = decodeElement(line);
     if (o.type === 'node') {
       if (o.tags.amenity && amenities.includes(o.tags.amenity)) {
@@ -162,6 +174,7 @@ export async function buildIndex(options) {
       }
     }
   }
+  amenityProgress(amenityBytes, true);
   await Promise.all([...open.values()].map((h) => h.close()));
   await nodes.close();
   if (missingCount) throw new Error(`Stage 4 missing references (${missingCount}); first: ${firstMissing}`);
@@ -170,6 +183,7 @@ export async function buildIndex(options) {
   const uniqueRows = await fs.open(path.join(tempRoot, 'unique-records.jsonl'), 'w');
   const shardBudget = Math.min(256, Math.max(32, Math.floor(ramMB * 0.2))) * 1024 * 1024;
   const cells = await fs.readdir(spoolDir);
+  const shardProgress = createProgress('stage 4 shards', cells.length, options.logger ?? console.log);
   for (const name of cells) {
     const cell = name.slice(0, -'.jsonl'.length);
     const dedup = new Map(); const mainSeen = new Set(); let cellBytes = 0;
@@ -203,6 +217,7 @@ export async function buildIndex(options) {
     readShard(await fs.readFile(target));
     await fs.writeFile(`${target}.done`, `${JSON.stringify({ fingerprint, sha256: createHash('sha256').update(bytes).digest('hex') })}\n`);
     shardCount++;
+    shardProgress(shardCount, shardCount === cells.length);
   }
   await uniqueRows.close();
   const uniqueCounts = await countUniqueRecords(tempRoot, (async function* () {
@@ -263,15 +278,19 @@ function normalizeTimestamp(value) {
 async function indexFingerprint(inputs, options) {
   const hash = createHash('sha256');
   hash.update(JSON.stringify(options));
-  for (const file of [...inputs.amenities, ...inputs.ways, ...inputs.nodes]) {
+  const inputFiles = [...inputs.amenities, ...inputs.ways, ...inputs.nodes];
+  const total = await totalFileBytes(inputFiles); let completed = 0;
+  const progress = createProgress('stage 4 input fingerprint', total, options.logger ?? console.log);
+  for (const file of inputFiles) {
     hash.update(`${path.basename(file)}:`);
     await new Promise((resolve, reject) => {
       const stream = createReadStream(file);
-      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('data', (chunk) => { hash.update(chunk); completed += chunk.length; progress(completed, completed >= total); });
       stream.once('error', reject); stream.once('end', resolve);
     });
     hash.update('\0');
   }
+  progress(total, true);
   return hash.digest('hex');
 }
 async function totalFileBytes(files) {

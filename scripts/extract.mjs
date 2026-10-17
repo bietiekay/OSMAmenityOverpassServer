@@ -29,6 +29,7 @@ import { buildIndex } from './extract/assembly.mjs';
 import { wasAborted } from './extract/process.mjs';
 import { parseArgs, flagBool, flagInt, parseStages } from './extract/args.mjs';
 import { createReadStream } from 'node:fs';
+import { createProgress } from './extract/progress.mjs';
 
 export async function sourceFingerprint(file) {
   const h = createHash('sha256');
@@ -166,7 +167,7 @@ export function detectFormat(fd) {
  * must be consumed exactly, and block types must be OSMHeader followed by
  * OSMData only.
  */
-export function scanBlocks(filePath) {
+export function scanBlocks(filePath, onProgress) {
   const fd = fs.openSync(filePath, 'r');
   const stat = fs.fstatSync(fd);
   const mode = detectFormat(fd);
@@ -184,6 +185,7 @@ export function scanBlocks(filePath) {
         }
         blocks.push({ index: blocks.length, offset, length: 4 + headerLen + parsed.datasize, type: parsed.type });
         offset += 4 + headerLen + parsed.datasize;
+        onProgress?.(offset, stat.size);
       }
     }
   } finally {
@@ -226,7 +228,9 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
   const CHUNKS_DIR = path.join(WORK_DIR, 'chunks');
   const STATE_DIR = path.join(WORK_DIR, 'state');
   logger(`stage 0: scanning ${planetSource} ...`);
-  const { blocks, fileSize } = scanBlocks(planetSource);
+  const scanProgress = createProgress('stage 0 scan', fs.statSync(planetSource).size, logger);
+  const { blocks, fileSize } = scanBlocks(planetSource, (bytes, total) => scanProgress(bytes, bytes >= total));
+  scanProgress(fileSize, true);
   const dataBlocks = blocks.slice(1);
   const targetBytes = chunkMb * 1024 * 1024;
   logger(`found ${blocks.length} blocks (${(fileSize / 1e9).toFixed(2)} GB), ` +
@@ -282,6 +286,7 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
   fs.mkdirSync(WORK_DIR, { recursive: true });
   fs.mkdirSync(path.join(STATE_DIR, 'stage0'), { recursive: true });
   logger(`writing ${groups.length} chunks -> ${CHUNKS_DIR}`);
+  const chunkProgress = createProgress('stage 0 chunks', groups.length, logger);
 
   const fdSource = await fs.promises.open(planetSource, 'r');
   const manifest = {
@@ -316,6 +321,7 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
       const expectedBlocks = [0, ...groups[i].map((b) => b.index)];
       if (markerData?.fingerprint === fingerprint && JSON.stringify(markerData.blocks) === JSON.stringify(expectedBlocks) && markerData.bytes === expectedLength && fs.existsSync(outPath) && fs.statSync(outPath).size === expectedLength && markerData.sha256 === await hashFile(outPath)) {
         manifest.chunks.push({ id, file: `${id}.pbf`, blocks: markerData.blocks, bytes: expectedLength, sha256: markerData.sha256 });
+        chunkProgress(i + 1);
         continue;
       }
       const group = groups[i];
@@ -351,9 +357,7 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
         bytes: fs.statSync(outPath).size,
         sha256: chunkHash
       });
-      if ((i + 1) % 5 === 0 || i === groups.length - 1) {
-        logger(`  chunk ${id + 1}/${groups.length} done`);
-      }
+      chunkProgress(i + 1, i === groups.length - 1);
       if (interrupted) break;
     }
   } finally {
@@ -479,7 +483,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   try { priorManifest = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'manifest.json'), 'utf8')); } catch {}
   if (!source && STAGES.includes(0)) throw new Error('--source <file.pbf> is required for stage 0');
   if (source) {
-    stageOpts.sourceFingerprint = await fingerprintFile(source);
+    const sourceSize = fs.statSync(source).size;
+    const fingerprintProgress = createProgress('source fingerprint', sourceSize, logger);
+    let fingerprintBytes = 0;
+    const fingerprintWithProgress = async (file) => {
+      const h = createHash('sha256');
+      for await (const chunk of createReadStream(file)) { h.update(chunk); fingerprintBytes += chunk.length; fingerprintProgress(fingerprintBytes, fingerprintBytes >= sourceSize); }
+      fingerprintProgress(sourceSize, true);
+      return h.digest('hex');
+    };
+    stageOpts.sourceFingerprint = deps.sourceFingerprint ? await fingerprintFile(source) : await fingerprintWithProgress(source);
     stageOpts.sourceMetadata = readSourceMetadata(source);
     stageOpts.source = path.resolve(source);
   } else {
@@ -508,7 +521,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       for (const n of [1, 2, 3]) await validateStageManifest(DATA_DIR, n, stageOpts.sourceFingerprint, chunkIds);
       const s1 = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'stage1/manifest.json'), 'utf8'));
       if (!s1.config?.allAmenities && stageOpts.amenities.some((value) => !(s1.config.amenities || []).includes(value))) throw new Error('Stage 4 amenity values were not retained by Stage 1; rerun stage 1 with those values or --all-amenity-values true');
-      await assemble({ pipelineDir: DATA_DIR, source: stageOpts.source, expectedChunkIds: chunkIds, amenities: stageOpts.amenities, shardPrecision: SHARD_PRECISION, ramMB: RAM_MB, sourceTimestamp: stageOpts.sourceMetadata.timestamp, sourceFingerprint: stageOpts.sourceFingerprint, replication: stageOpts.sourceMetadata.replication });
+      await assemble({ pipelineDir: DATA_DIR, source: stageOpts.source, expectedChunkIds: chunkIds, amenities: stageOpts.amenities, shardPrecision: SHARD_PRECISION, ramMB: RAM_MB, sourceTimestamp: stageOpts.sourceMetadata.timestamp, sourceFingerprint: stageOpts.sourceFingerprint, replication: stageOpts.sourceMetadata.replication, logger });
     }
     if (aborted()) return;
   }
