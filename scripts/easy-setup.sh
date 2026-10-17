@@ -162,10 +162,17 @@ else
   printf '\nOSM Amenity Server — Docker Compose setup\n'
   printf 'Planet import and replication are not yet validated at planet scale. Keep existing proxy upstreams available.\n'
   printf 'Press Enter to accept defaults. Configuration is reviewed before it is written.\n\n'
+  printf 'Storage overview (all paths below are on this host):\n'
+  printf '  Source:   the original planet PBF download. It is kept unchanged for updates and recovery.\n'
+  printf '  Pipeline: import chunks, intermediate files, indexes and the active served data. Old generations can remain here.\n'
+  printf '  Config:   small text configuration files; this does not hold planet data.\n'
+  printf 'Disk planning: reserve space for the source PBF, roughly another source-sized set of chunks, import/index working data,\n'
+  printf 'and the new index while an old one is still active. Exact planet usage is not measured; leave substantial extra headroom.\n'
+  printf 'Check free space on the filesystems containing source and pipeline paths with: df -h /srv\n\n'
   printf 'Step 1/5: Paths and source\n'
   ask_path repository 'Application checkout' "$repository"
   ask_path deployment 'Deployment configuration directory' /srv/osm-amenity/deployment
-  ask_path pipeline 'Writable pipeline directory' /srv/osm-amenity/pipeline
+  ask_path pipeline 'Writable pipeline directory (chunks, work files and served indexes; needs most disk space)' /srv/osm-amenity/pipeline
   while true; do
     ask source_mode 'Source: download or existing' download
     [[ $source_mode == download || $source_mode == existing ]] && break
@@ -177,13 +184,15 @@ else
     [[ -f $source_path ]] || fail "Source file does not exist: $source_path"
     sources=$(dirname -- "$source_path"); source_file=$(basename -- "$source_path")
   else
-    ask_path sources 'Retained source directory' /srv/osm-amenity/sources
+    ask_path sources 'Retained source directory (kept planet PBF; allow its full download size)' /srv/osm-amenity/sources
     ask source_file 'Retained source filename (never overwrite after importing)' planet-initial.osm.pbf
     ask_url source_url 'Planet PBF download URL (a dated URL is best for resuming)' "$source_url"
     ask_url checksum_url 'Matching MD5 checksum URL' "$source_url.md5"
   fi
 
   printf '\nStep 2/5: Docker and proxy connectivity\n'
+  printf 'The proxy is your existing Overpass-Proxy: it receives client queries and forwards them to this amenity backend.\n'
+  printf 'It can send other or unsupported queries to fallback Overpass servers. The proxy stays a separate deployment.\n'
   ask_name project 'Compose project name' osm-amenity
   ask_name service 'Backend Compose service name' amenity-server
   ask_name network 'Shared Docker network name' osm-overpass
@@ -195,7 +204,7 @@ else
   done
   ask_int host_port 'Host HTTP port' 8081 1 65535
   while true; do
-    ask proxy_mode 'Proxy location: docker (same host), host, or remote' docker
+    ask proxy_mode 'Where does the existing query-forwarding proxy run: docker (same host), host, or remote?' docker
     [[ $proxy_mode == docker || $proxy_mode == host || $proxy_mode == remote ]] && break
   done
   ask_name proxy_service 'Existing proxy Compose service name (for integration example)' proxy
@@ -263,7 +272,7 @@ OSM_AMENITY_REEXTRACT_EVERY_SECONDS=$rebuild_seconds
 LOG_VERBOSITY=$log_level
 ENV
   cat > "$deployment/docker-compose.yml" <<YAML
-version: '3.8'
+version: '3.3'
 services:
   $service:
     build: '$repository'

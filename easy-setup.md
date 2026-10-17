@@ -47,6 +47,46 @@ The wizard asks for:
 - Initial extraction RAM/worker/chunk budgets, retention of intermediate amenity
   values and chunks, and source/chunk verification.
 
+### Storage and disk space
+
+The three paths have different jobs:
+
+- **Source directory** keeps the original planet `.osm.pbf` unchanged. The updater
+  needs this baseline later, so do not delete or replace it. Allow at least the
+  full downloaded file size, plus space for a partial download while one is in
+  progress.
+- **Pipeline directory** is the main data volume. It contains temporary PBF
+  chunks, intermediate extraction and lookup files, the active shard index, and
+  may retain old generations during rebuilds. The chunk set is roughly another
+  source-sized copy; intermediate files and the index add more, and rebuilds
+  can temporarily need space alongside the currently active generation.
+- **Deployment directory** holds Compose and environment configuration and is
+  small compared with the other two.
+
+There is no measured full-planet disk requirement or import result yet, so the
+wizard cannot promise a safe fixed number of GB. Before starting, check free
+space on the filesystems that contain both data paths (`df -h /srv`, replacing
+`/srv` with the relevant mount point). Keep substantial headroom beyond the PBF
+and chunk sizes; do not use the download size alone as your disk budget. The
+wizard's RAM budget is for extraction workers and is not disk space or a total
+container memory limit.
+
+### What “proxy” means here
+
+The **Overpass-Proxy** is the existing service your users or applications send
+Overpass queries to. It chooses a backend and forwards the query. This setup
+adds the Amenity Server as one backend; it does not install or replace the
+proxy. The Amenity Server handles the supported amenity queries (such as
+`amenity=toilets`). For unsupported query types it responds with HTTP 501, so
+the proxy should have another Overpass upstream available as a fallback.
+
+The wizard asks where that existing proxy runs so it can show the correct
+backend URL: a shared Docker network for a proxy container on the same host, a
+host address for a proxy process on that host, or a reachable URL for a remote
+proxy. The generated proxy example is an integration hint; merge it into the
+proxy's existing configuration and recreate that proxy yourself. The wizard
+does not change the proxy deployment, DNS, TLS, or VPN routing.
+
 It shows a review before writing files. It then offers image building, download
 with checksum verification, source-header validation, detached import, startup,
 HTTP checks, and a proxy integration example. The exact replication URL is read
@@ -127,7 +167,7 @@ dc version
 ```
 
 The commands support both `docker compose` and a `docker-compose` installation
-that supports Compose file version 3.8 and `run --no-deps`. Upgrade Compose if it
+that supports Compose file version 3.3 and `run --no-deps`. Upgrade Compose if it
 rejects the file below.
 
 Use local SSD/NVMe storage. Before downloading, check available RAM, disk space,
@@ -233,7 +273,7 @@ From `/opt/osm-amenity-server`, create `docker-compose.yml`:
 
 ```bash
 cat > docker-compose.yml <<'YAML'
-version: '3.8'
+version: '3.3'
 services:
   amenity-server:
     build: .
