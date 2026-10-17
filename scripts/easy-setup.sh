@@ -330,7 +330,28 @@ dc() { "$deployment/compose.sh" "$@"; }
 resume_hint() {
   printf '\nTo continue: bash %q --resume %q\n' "$repository/scripts/easy-setup.sh" "$deployment"
 }
-trap 'printf "\nSetup paused. Any detached import continues running.\n"; resume_hint; exit 130' INT TERM
+on_interrupt() {
+  local signal=$1 owner running
+  trap - INT TERM
+  printf '\nSetup interrupted (%s).\n' "$signal"
+  if [[ -n ${import_name:-} ]] && command -v docker >/dev/null && docker inspect "$import_name" >/dev/null 2>&1; then
+    owner=$(docker inspect --format '{{index .Config.Labels "io.osm-amenity.setup"}}' "$import_name" 2>/dev/null || true)
+    running=$(docker inspect --format '{{.State.Running}}' "$import_name" 2>/dev/null || true)
+    if [[ $owner == "$deployment" && $running == true ]]; then
+      printf 'Stopping this deployment’s detached import (%s); waiting up to 120 seconds for a graceful stop...\n' "$import_name"
+      if docker stop --time 120 "$import_name" >/dev/null; then
+        docker rm "$import_name" >/dev/null 2>&1 || true
+        printf 'Detached import stopped and its container removed. Completed work is retained; --resume will continue from it.\n'
+      else
+        printf 'Could not stop the import automatically. Check it with: docker ps --filter name=%q\n' "$import_name" >&2
+      fi
+    fi
+  fi
+  resume_hint
+  exit 130
+}
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
 printf '\nConfiguration: %s\nCompose wrapper: %s/compose.sh\n' "$deployment" "$deployment"
 if [[ $configure_only == true ]]; then resume_hint; exit 0; fi
 command -v docker >/dev/null || fail 'Docker is required. Configuration is saved; use --resume after installing Docker.'
@@ -457,7 +478,7 @@ fi
 if [[ $has_import == true ]]; then
   printf '\nDetached import: %s\nYou can disconnect SSH; the container keeps running.\n' "$import_name"
   printf 'Resource monitoring: docker stats %q\n' "$import_name"
-  confirm 'Follow import logs and wait for completion now? (Ctrl-C pauses this wizard)' yes || { resume_hint; exit 0; }
+  confirm 'Follow import logs and wait for completion now? (Ctrl-C stops the import)' yes || { resume_hint; exit 0; }
   docker logs --follow "$import_name"
   import_exit=$(docker wait "$import_name")
   [[ $import_exit == 0 ]] || fail "Import exited with code $import_exit. Resolve the logged error, then use --resume."

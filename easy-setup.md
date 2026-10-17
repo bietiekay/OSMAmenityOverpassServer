@@ -163,10 +163,12 @@ bash /opt/osm-amenity-server/scripts/easy-setup.sh \
   --resume /srv/osm-amenity/deployment
 ```
 
-Substitute your selected deployment directory if different. Ctrl-C while
-following import logs exits the wizard while leaving the detached import
-running. Resuming reuses that container; a failed import must be resolved before
-startup. A successful import is not launched again. If the source's `latest`
+Substitute your selected deployment directory if different. Ctrl-C or TERM in
+the Easy Setup wizard stops its own detached import container gracefully (up
+to 120 seconds), then removes that stopped container. Completed pipeline work
+is retained, so `--resume` starts a fresh container and reuses completed work.
+A failed import must be resolved before startup. A successful import is not
+launched again. If the source's `latest`
 URL changes during an interrupted download, use a matching fixed dated URL or
 move the old partial download aside before restarting that download.
 
