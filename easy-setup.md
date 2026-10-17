@@ -55,6 +55,45 @@ space; serving a new value later requires rerunning extraction from the PBF.
 Either choice serves only the amenity values configured for the active index
 and server. It does not turn on every amenity automatically.
 
+**Shard precision** controls how the geographic index is divided into cells;
+it does not set shard file size in megabytes. A higher number creates smaller
+geographic cells and more shard files, while a lower number creates fewer,
+larger shards. Large shards can take longer to read and may exceed the build's
+per-cell memory budget. The default is `5`; keep it unless you have a specific
+reason to tune it. The server's configured precision must match the imported
+index.
+
+Approximate cell dimensions for the supported values (width × height at the
+equator):
+
+| Precision | Approximate cell dimensions |
+|---:|---:|
+| 3 | 156 × 156 km |
+| 4 | 39 × 19.5 km |
+| 5 | 4.9 × 4.9 km |
+| 6 | 1.2 km × 610 m |
+| 7 | 153 × 153 m |
+
+At Germany's latitude, east-west width is about 60% of the equatorial value;
+north-south height stays nearly the same. These are geographic cell dimensions,
+not the size of the corresponding shard file.
+
+For a query, the server finds the cells touched by its bounding box and loads
+those shards. With higher precision, a small-area query usually reads less
+unrelated nearby data, but may need to open more small shard files, especially
+for larger query areas. With lower precision, it opens fewer shards, but each
+can contain more unrelated nearby objects to inspect. Precision therefore
+affects query work and storage layout, not the geographic accuracy of the
+returned results. The default `5` balances these costs; changing it requires
+rebuilding the index and matching the server setting.
+
+For example, at precision `5`, a query around one neighborhood will usually
+touch only a few cells of roughly 5 km across, while a country-wide query will
+touch many. Increasing to precision `6` may reduce unrelated data for the
+neighborhood query, but increases the number of separate shards loaded for a
+country-wide query. Cell borders matter too: a small query can touch multiple
+cells when it crosses a border.
+
 ### Storage and disk space
 
 The three paths have different jobs:

@@ -221,7 +221,15 @@ else
 
   printf '\nStep 3/5: Served data and update settings\n'
   ask amenities 'Amenity values (lowercase, comma-separated, no spaces)' toilets
-  ask_int precision 'Shard precision' 5 3 7
+  printf 'Shard precision divides the map into geographic cells; it is not a file-size setting. Approximate cell dimensions:\n'
+  printf '  3: 156 x 156 km; 4: 19.5 x 39 km; 5: 4.9 x 4.9 km; 6: 610 m x 1.2 km; 7: 153 x 153 m (at the equator).\n'
+  printf 'At Germany latitudes, east-west cells are about 60%% as wide. Each query loads the cells its bounding box touches.\n'
+  printf 'Higher precision means smaller cells and often less unrelated data per small query, but more cells/files to load;\n'
+  printf 'lower precision means fewer, larger cells and can read more unrelated nearby data. Large cells can exceed build limits.\n'
+  printf 'Example: precision 5 may touch only a few roughly 5 km cells for a neighborhood query; a country-wide query touches many.\n'
+  printf 'Higher precision can narrow small queries but creates more shards for large-area queries. Cell borders can add cells.\n'
+  printf 'Default 5 is a practical balance. Keep the same precision in the server and imported index.\n'
+  ask_int precision 'Geographic shard precision (3-7; default 5)' 5 3 7
   ask_int cache_mb 'HTTP shard cache (MiB)' 256 1 1048576
   ask_int update_seconds 'Update-loop sleep interval (seconds)' 3600 1 31536000
   ask_int rebuild_seconds 'Weekly drift rebuild interval (seconds)' 604800 1 31536000
