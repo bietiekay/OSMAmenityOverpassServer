@@ -42,8 +42,10 @@ export function sourceMetadata(file) {
 }
 export function sourceMetadataFromHeader(header) {
   const options = header.option ?? {};
-  const baseUrl = options.osmosis_replication_base_url;
-  const sequenceNumber = Number(options.osmosis_replication_sequence_number);
+  // Bootstrap overrides are passed only to the initial extraction. Weekly
+  // re-extractions must use metadata belonging to their own candidate PBF.
+  const baseUrl = options.osmosis_replication_base_url ?? process.env.OSM_AMENITY_BOOTSTRAP_REPLICATION_BASE_URL;
+  const sequenceNumber = Number(options.osmosis_replication_sequence_number ?? process.env.OSM_AMENITY_BOOTSTRAP_REPLICATION_SEQUENCE_NUMBER);
   const intervalFromUrl = (url) => /(?:^|\/)(minute|hour|day)(?:\/|$)/i.exec(url)?.[1]?.toLowerCase();
   const intervalFromTimestamp = (url) => /-updates(?:\/|$)/i.test(url) ? 'day' : undefined;
   return {

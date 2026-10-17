@@ -137,8 +137,9 @@ does not change the proxy deployment, DNS, TLS, or VPN routing.
 It shows a review before writing files. It then offers image building, download
 with checksum verification, source-header validation, detached import, startup,
 HTTP checks, and a proxy integration example. The exact replication URL is read
-from the PBF rather than guessed. Initial extraction settings do not change the
-automatic weekly rebuild's resource defaults.
+from the PBF when available. For the official planet dump, it derives a safe
+minute-feed start sequence with `pyosmium-get-changes`. Initial extraction
+settings do not change the automatic weekly rebuild's resource defaults.
 
 To generate configuration without downloading or using Docker:
 
@@ -352,7 +353,7 @@ dc config
 dc build
 ```
 
-The image includes Node.js 22 and osmium. Only port 8081 on the host's loopback
+The image includes Node.js 22, osmium, and PyOsmium's replication helper. Only port 8081 on the host's loopback
 address is published. Requests from the proxy containers use the shared network.
 The containers currently run as root, so the bind-mounted pipeline will contain
 root-owned files.
@@ -366,31 +367,24 @@ dc run --rm --no-deps -T amenity-server \
   osmium fileinfo --json /source/planet-initial.osm.pbf
 ```
 
-Now validate that this snapshot has a usable planet/minute cursor and save its
-exact replication URL. Run this before starting the import:
+The official `planet-latest.osm.pbf` can have a valid timestamp but no exact
+replication sequence. The planet dump is not cut at a replication-diff
+boundary, so that is expected. The setup script uses `pyosmium-get-changes` to
+find a safe minute-feed start point from the PBF. It saves the cursor in
+`replication.env`, puts the feed URL in `server.env`, then passes the cursor
+through extraction into the active generation.
+
+You can inspect the suggested start sequence manually with:
 
 ```bash
-dc run --rm --no-deps -T amenity-server node --input-type=module -e '
-import { sourceMetadata } from "./scripts/extract.mjs";
-const metadata = sourceMetadata("/source/planet-initial.osm.pbf");
-const r = metadata.replication;
-if (!r || r.kind !== "planet" || r.interval !== "minute" ||
-    !Number.isSafeInteger(r.sequenceNumber) || r.sequenceNumber <= 0 ||
-    !metadata.timestamp || !Number.isFinite(Date.parse(metadata.timestamp))) {
-  throw new Error("A planet PBF with valid timestamp and planet/minute replication metadata is required");
-}
-console.log("OSM_AMENITY_UPDATE_BASE_URL=" + r.baseUrl);
-' > /srv/osm-amenity/replication.env
-test -s /srv/osm-amenity/replication.env
-sed -i '/^OSM_AMENITY_UPDATE_BASE_URL=/d' /srv/osm-amenity/server.env
-cat /srv/osm-amenity/replication.env >> /srv/osm-amenity/server.env
-cat /srv/osm-amenity/replication.env
+dc run --rm --no-deps -T amenity-server \
+  pyosmium-get-changes -O /source/planet-initial.osm.pbf
 ```
 
-The URL may include `/minute`. Keep the exact URL recorded by the snapshot;
-changing it to an equivalent-looking root URL causes a namespace mismatch.
-If validation fails, obtain a snapshot with the required provenance. Do not
-invent a sequence number or use the download time as the source timestamp.
+The wizard does this automatically. Do not copy the suggested sequence into
+`server.env` by hand: PyOsmium reports the first diff to apply, while this
+server persists the last applied sequence. Do not infer the cursor from the
+snapshot timestamp or substitute the latest sequence.
 
 ## 6. Import the planet in a background container
 

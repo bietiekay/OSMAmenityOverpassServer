@@ -374,24 +374,51 @@ fi
 
 if [[ $active == false ]]; then
   printf '\nChecking source timestamp and planet/minute replication provenance...\n'
-  dc run --rm --no-deps -T "$service" node --input-type=module -e '
+  if [[ -f $deployment/replication.env ]]; then
+    mapfile -t replication_settings < "$deployment/replication.env"
+    (( ${#replication_settings[@]} == 2 )) || fail 'Saved replication.env is invalid; inspect it before continuing.'
+    feed_setting=${replication_settings[0]}
+    sequence_setting=${replication_settings[1]}
+    [[ $feed_setting == OSM_AMENITY_UPDATE_BASE_URL=* && $sequence_setting == OSM_AMENITY_REPLICATION_SEQUENCE_NUMBER=* ]] || fail 'Saved replication.env is invalid; inspect it before continuing.'
+    url_ok "${feed_setting#*=}" && positive "${sequence_setting#*=}" || fail 'Saved replication.env contains invalid values.'
+  else
+    dc run --rm --no-deps -T "$service" node --input-type=module -e '
 import { sourceMetadata } from "./scripts/extract.mjs";
+import { spawnSync } from "node:child_process";
 const m = sourceMetadata(process.env.OSM_AMENITY_SOURCE_PBF);
-const r = m.replication;
+if (!m.timestamp || !Number.isFinite(Date.parse(m.timestamp))) {
+  throw new Error("Snapshot needs a valid timestamp in its PBF header");
+}
+let r = m.replication;
 if (!r || r.kind !== "planet" || r.interval !== "minute" ||
-    !Number.isSafeInteger(r.sequenceNumber) || r.sequenceNumber <= 0 ||
-    !m.timestamp || !Number.isFinite(Date.parse(m.timestamp))) {
-  throw new Error("Snapshot needs a valid timestamp and planet/minute replication cursor");
+    !Number.isSafeInteger(r.sequenceNumber) || r.sequenceNumber <= 0) {
+  console.error("Planet PBF has no usable minute cursor; finding a safe start sequence...");
+  const found = spawnSync("pyosmium-get-changes", ["-O", process.env.OSM_AMENITY_SOURCE_PBF], { encoding: "utf8" });
+  if (found.status !== 0) throw new Error(`pyosmium-get-changes failed: ${found.stderr || found.error || "unknown error"}`);
+  const nextSequence = Number(found.stdout.trim());
+  if (!Number.isSafeInteger(nextSequence) || nextSequence <= 1) {
+    throw new Error(`pyosmium-get-changes returned an invalid starting sequence: ${found.stdout.trim()}`);
+  }
+  // pyosmium reports the first diff to apply; this server stores the last applied sequence.
+  r = { baseUrl: "https://planet.openstreetmap.org/replication/minute", sequenceNumber: nextSequence - 1, kind: "planet", interval: "minute" };
 }
 console.log("OSM_AMENITY_UPDATE_BASE_URL=" + r.baseUrl);
+console.log("OSM_AMENITY_REPLICATION_SEQUENCE_NUMBER=" + r.sequenceNumber);
 ' > "$deployment/replication.env.tmp"
-  IFS= read -r feed_setting < "$deployment/replication.env.tmp"
-  [[ $feed_setting == OSM_AMENITY_UPDATE_BASE_URL=* ]] || fail 'Invalid source metadata output.'
-  url_ok "${feed_setting#*=}" || fail 'Unsupported replication URL in source header.'
-  sed '/^OSM_AMENITY_UPDATE_BASE_URL=/d' "$deployment/server.env" > "$deployment/server.env.tmp"
+    mapfile -t replication_settings < "$deployment/replication.env.tmp"
+    (( ${#replication_settings[@]} == 2 )) || fail 'Invalid source metadata output.'
+    feed_setting=${replication_settings[0]}
+    sequence_setting=${replication_settings[1]}
+    [[ $feed_setting == OSM_AMENITY_UPDATE_BASE_URL=* && $sequence_setting == OSM_AMENITY_REPLICATION_SEQUENCE_NUMBER=* ]] || fail 'Invalid source metadata output.'
+    url_ok "${feed_setting#*=}" || fail 'Unsupported replication URL in source header.'
+    positive "${sequence_setting#*=}" || fail 'Invalid replication sequence from source metadata.'
+    mv -- "$deployment/replication.env.tmp" "$deployment/replication.env"
+  fi
+  replication_base=${feed_setting#*=}
+  replication_sequence=${sequence_setting#*=}
+  sed -e '/^OSM_AMENITY_UPDATE_BASE_URL=/d' -e '/^OSM_AMENITY_REPLICATION_SEQUENCE_NUMBER=/d' "$deployment/server.env" > "$deployment/server.env.tmp"
   printf '%s\n' "$feed_setting" >> "$deployment/server.env.tmp"
   mv -- "$deployment/server.env.tmp" "$deployment/server.env"
-  mv -- "$deployment/replication.env.tmp" "$deployment/replication.env"
 fi
 
 import_name=$project-import
@@ -417,7 +444,10 @@ if [[ $active == false && $has_import == false ]]; then
   confirm 'Launch/resume extraction stages 0-4 in a detached container?' yes || { resume_hint; exit 0; }
   # Avoid any concurrent automatic updater writing this pipeline.
   dc stop "$service"
-  dc run -d --no-deps --name "$import_name" --label "io.osm-amenity.setup=$deployment" "$service" \
+  dc run -d --no-deps \
+    -e "OSM_AMENITY_BOOTSTRAP_REPLICATION_BASE_URL=$replication_base" \
+    -e "OSM_AMENITY_BOOTSTRAP_REPLICATION_SEQUENCE_NUMBER=$replication_sequence" \
+    --name "$import_name" --label "io.osm-amenity.setup=$deployment" "$service" \
     node scripts/extract.mjs --source "/source/$source_file" --data-dir /osm --stages 0-4 \
     --amenities "$amenities" --shard-precision "$precision" \
     --chunk-mb "$chunk_mb" --ram-mb "$ram_mb" --worker-ram-mb "$worker_mb" --workers "$workers" \
