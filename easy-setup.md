@@ -110,8 +110,12 @@ The three paths have different jobs:
 - **Deployment directory** holds Compose and environment configuration and is
   small compared with the other two.
 
-There is no measured full-planet disk requirement or import result yet, so the
-wizard cannot promise a safe fixed number of GB. Before starting, check free
+There is no measured full-planet disk requirement or total host RAM requirement
+yet, so the wizard cannot promise a safe fixed amount of storage or memory.
+However, a full-planet import has shown that **1024 MiB per extraction worker is
+insufficient in practice**. Configure at least **2048 MiB per worker**; the
+pipeline RAM budget must cover all workers plus a 512 MiB controller reserve.
+Before starting, check free
 space on the filesystems that contain both data paths (`df -h /srv`, replacing
 `/srv` with the relevant mount point). Keep substantial headroom beyond the PBF
 and chunk sizes; do not use the download size alone as your disk budget. The
@@ -236,7 +240,9 @@ the active index. **The PBF download size alone is not a disk-space budget.**
 There is no measured planet RAM/disk requirement or import duration yet.
 
 The import below requests an 8 GiB pipeline budget with up to three 2 GiB
-workers. Leave additional host RAM for Docker, the OS, the proxy, and Redis.
+workers. Do not lower the per-worker budget to 1024 MiB for a planet import; a
+worker can exceed that limit and fail. Leave additional host RAM for Docker, the
+OS, the proxy, and Redis.
 Those extraction settings are not a total container memory limit, and do not
 carry over to the automatic weekly rebuild, which uses pipeline defaults.
 Monitor actual usage throughout commissioning.

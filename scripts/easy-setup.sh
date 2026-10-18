@@ -124,6 +124,7 @@ validate_settings() {
     positive "${!key}" || fail "Invalid integer in $key."
   done
   (( host_port <= 65535 && precision >= 3 && precision <= 7 )) || fail 'Invalid port or shard precision.'
+  (( worker_mb >= 2048 )) || fail 'Planet imports need at least 2048 MiB per worker; 1024 MiB is insufficient.'
   (( ram_mb >= worker_mb + 512 && workers * worker_mb + 512 <= ram_mb )) || fail 'RAM budget must cover all workers plus a 512 MiB controller reserve.'
   for key in all_values keep_chunks verify; do
     [[ ${!key} == true || ${!key} == false ]] || fail "Invalid boolean in $key."
@@ -240,9 +241,11 @@ else
 
   printf '\nStep 4/5: Initial extraction resources\n'
   printf 'Leave RAM for the OS, Docker and the proxy. These budgets do not limit the whole container or future weekly rebuilds.\n'
+  printf 'For a full-planet import, 1024 MiB per worker is insufficient in practice; use at least 2048 MiB per worker.\n'
+  printf 'The total pipeline budget must cover workers x per-worker RAM plus a 512 MiB controller reserve.\n'
   ask_int chunk_mb 'PBF chunk size (MiB)' 256 1 1048576
-  ask_int ram_mb 'Pipeline RAM budget (MiB)' 8192 513 1048576
-  ask_int worker_mb 'Per-worker RAM budget (MiB)' 2048 1 "$((ram_mb - 512))"
+  ask_int ram_mb 'Pipeline RAM budget (MiB)' 8192 2560 1048576
+  ask_int worker_mb 'Per-worker RAM budget (MiB; at least 2048 for planet imports)' 2048 2048 "$((ram_mb - 512))"
   max_workers=$(((ram_mb - 512) / worker_mb))
   default_workers=3; (( max_workers >= 3 )) || default_workers=$max_workers
   ask_int workers 'Maximum extraction workers' "$default_workers" 1 "$max_workers"
