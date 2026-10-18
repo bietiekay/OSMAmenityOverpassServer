@@ -104,7 +104,11 @@ node scripts/extract.mjs \
 Supported extraction options are `--source`/`--planet-source`, `--data-dir`,
 `--stages` (`0`, a stage, or range such as `0-4`), `--chunk-mb`, `--ram-mb`,
 `--worker-ram-mb`, `--workers`, `--shard-precision`, `--keep-chunks`,
-`--all-amenity-values`, `--amenities`, and `--verify`. Extraction requires
+`--all-amenity-values`, `--amenities`, `--verify`, and `--resume-mode trust|verify`.
+Easy Setup defaults to trusting a completed stage 0 manifest and per-unit done
+markers on resume, then continues at the first incomplete stage or chunk. Choose
+verification in the wizard to perform the full source, chunk, and output hash
+checks. Direct CLI use defaults to `--resume-mode verify`. Extraction requires
 `osmium-tool`; run `node scripts/extract.mjs` with no stage source to resume a
 previously recorded stage from `work/manifest.json`. Specify the intended
 `--stages` and `--data-dir`; the CLI defaults to stage 0, which requires a source.

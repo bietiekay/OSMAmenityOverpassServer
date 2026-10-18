@@ -465,14 +465,54 @@ if docker inspect "$import_name" >/dev/null 2>&1; then
   fi
 fi
 if [[ $active == false && $has_import == false ]]; then
-  confirm 'Launch/resume extraction stages 0-4 in a detached container?' yes || { resume_hint; exit 0; }
+  stage_range=0-4
+  resume_mode=verify
+  stage0_manifest=$pipeline/work/manifest.json
+  if [[ -f $stage0_manifest ]] && grep -Eq '"complete"[[:space:]]*:[[:space:]]*true' "$stage0_manifest"; then
+    stage0_date=$(sed -nE 's/.*"completedAt"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$stage0_manifest" | head -n 1)
+    [[ -n $stage0_date ]] || stage0_date=$(sed -nE 's/.*"createdAt"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$stage0_manifest" | head -n 1)
+    printf '\nStage 0 is marked complete%s.\n' "${stage0_date:+ (manifest date: $stage0_date)}"
+    latest_marker=$(find "$pipeline/work/state" -type f -name '*.done' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 || true)
+    if [[ -n $latest_marker ]]; then
+      latest_marker_time=${latest_marker%% *}
+      latest_marker_path=${latest_marker#* }
+      latest_marker_date=$(date -d "@${latest_marker_time%%.*}" '+%Y-%m-%d %H:%M:%S %Z')
+      printf 'Last completed work unit: %s (%s).\n' "$(basename "$latest_marker_path" .done)" "$latest_marker_date"
+    fi
+    if confirm 'Trust the saved manifest and completed work markers, and resume at the first incomplete stage/chunk? This skips full-file hashes and trusts existing data. Choose no to verify everything as before.' yes; then
+      stage_range=1-4
+      resume_mode=trust
+      printf 'Resume mode: trust existing progress; only incomplete work units will be processed.\n'
+    else
+      printf 'Resume mode: verify source, chunks and completed outputs before continuing; this can take hours.\n'
+    fi
+  elif [[ -f $stage0_manifest ]] && grep -Eq '"complete"[[:space:]]*:[[:space:]]*false' "$stage0_manifest" && grep -Eq '"sourceFingerprint"[[:space:]]*:[[:space:]]*"[[:xdigit:]]+"' "$stage0_manifest"; then
+    stage0_date=$(sed -nE 's/.*"createdAt"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$stage0_manifest" | head -n 1)
+    printf '\nStage 0 was interrupted%s.\n' "${stage0_date:+ (manifest started: $stage0_date)}"
+    latest_marker=$(find "$pipeline/work/state" -type f -name '*.done' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 || true)
+    if [[ -n $latest_marker ]]; then
+      latest_marker_time=${latest_marker%% *}
+      latest_marker_path=${latest_marker#* }
+      latest_marker_date=$(date -d "@${latest_marker_time%%.*}" '+%Y-%m-%d %H:%M:%S %Z')
+      printf 'Last completed work unit: %s (%s).\n' "$(basename "$latest_marker_path" .done)" "$latest_marker_date"
+    fi
+    if confirm 'Trust the partial stage 0 manifest and completed chunk markers, and continue at the first incomplete chunk? Choose no to verify the source and completed chunks again.' yes; then
+      resume_mode=trust
+      printf 'Resume mode: trust saved progress; stage 0 will scan block headers and repeat only incomplete chunks.\n'
+    else
+      printf 'Resume mode: verify source, chunks and completed outputs before continuing; this can take hours.\n'
+    fi
+  else
+    printf '\nStage 0 has no complete manifest; it must run and verify the source before continuing.\n'
+  fi
+  confirm "Launch/resume extraction stages $stage_range in a detached container?" yes || { resume_hint; exit 0; }
   # Avoid any concurrent automatic updater writing this pipeline.
   dc stop "$service"
   dc run -d --no-deps \
     -e "OSM_AMENITY_BOOTSTRAP_REPLICATION_BASE_URL=$replication_base" \
     -e "OSM_AMENITY_BOOTSTRAP_REPLICATION_SEQUENCE_NUMBER=$replication_sequence" \
     --name "$import_name" --label "io.osm-amenity.setup=$deployment" "$service" \
-    node scripts/extract.mjs --source "/source/$source_file" --data-dir /osm --stages 0-4 \
+    node scripts/extract.mjs --source "/source/$source_file" --data-dir /osm --stages "$stage_range" --resume-mode "$resume_mode" \
     --amenities "$amenities" --shard-precision "$precision" \
     --chunk-mb "$chunk_mb" --ram-mb "$ram_mb" --worker-ram-mb "$worker_mb" --workers "$workers" \
     --all-amenity-values "$all_values" --keep-chunks "$keep_chunks" --verify "$verify"

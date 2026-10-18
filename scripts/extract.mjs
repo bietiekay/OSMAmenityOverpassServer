@@ -16,7 +16,7 @@
  *   node scripts/extract.mjs --planet-source <file.pbf> --data-dir <dir>
  *      [--stages 0] [--chunk-mb 1024] [--workers N]
  *      [--keep-chunks true|false] [--all-amenity-values true|false]
- *      [--verify]
+ *      [--verify] [--resume-mode trust|verify]
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -223,7 +223,7 @@ function markDone(dataDir, stage, unit, payload) {
   fs.renameSync(tmp, file);
 }
 
-export async function runStage0({ planetSource, fingerprint, metadata = {}, dataDir = process.cwd(), chunkMb = 1024, keepChunks = true, logger = log }) {
+export async function runStage0({ planetSource, fingerprint, metadata = {}, dataDir = process.cwd(), chunkMb = 1024, keepChunks = true, resumeMode = 'verify', logger = log }) {
   const WORK_DIR = path.join(dataDir, 'work');
   const CHUNKS_DIR = path.join(WORK_DIR, 'chunks');
   const STATE_DIR = path.join(WORK_DIR, 'state');
@@ -295,18 +295,21 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
     sourceTimestamp: metadata.timestamp,
     replication: metadata.replication ?? null,
     planetSizeBytes: fileSize,
+    planetSourceModifiedMs: fs.statSync(planetSource).mtimeMs,
     blockCount: blocks.length,
     chunkTargetMb: chunkMb,
     complete: false,
     createdAt: new Date().toISOString(),
+    completedAt: null,
     chunks: []
   };
 
-  let interrupted = false;
+  let interrupted = wasAborted();
   const onSignal = (signal) => {
     interrupted = true;
     logger(`received ${signal}, finishing current chunk then stopping (resume with the same command)`);
   };
+  if (interrupted) logger('stop requested while scanning; finishing at most the current chunk before saving resume progress');
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
 
@@ -319,9 +322,11 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
       try { markerData = JSON.parse(fs.readFileSync(marker, 'utf8')); } catch {}
       const expectedLength = blocks[0].length + groups[i].reduce((sum, b) => sum + b.length, 0);
       const expectedBlocks = [0, ...groups[i].map((b) => b.index)];
-      if (markerData?.fingerprint === fingerprint && JSON.stringify(markerData.blocks) === JSON.stringify(expectedBlocks) && markerData.bytes === expectedLength && fs.existsSync(outPath) && fs.statSync(outPath).size === expectedLength && markerData.sha256 === await hashFile(outPath)) {
+      const markerMatches = markerData?.fingerprint === fingerprint && JSON.stringify(markerData.blocks) === JSON.stringify(expectedBlocks) && markerData.bytes === expectedLength && fs.existsSync(outPath) && fs.statSync(outPath).size === expectedLength;
+      if (markerMatches && (resumeMode === 'trust' || markerData.sha256 === await hashFile(outPath))) {
         manifest.chunks.push({ id, file: `${id}.pbf`, blocks: markerData.blocks, bytes: expectedLength, sha256: markerData.sha256 });
         chunkProgress(i + 1);
+        if (interrupted) break;
         continue;
       }
       const group = groups[i];
@@ -368,6 +373,7 @@ export async function runStage0({ planetSource, fingerprint, metadata = {}, data
 
   const tmpManifest = path.join(WORK_DIR, 'manifest.json.tmp');
   manifest.complete = !interrupted && manifest.chunks.length === groups.length;
+  if (manifest.complete) manifest.completedAt = new Date().toISOString();
   fs.writeFileSync(tmpManifest, JSON.stringify(manifest, null, 2));
   fs.renameSync(tmpManifest, path.join(WORK_DIR, 'manifest.json'));
 
@@ -478,22 +484,35 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 
   if (source && !fs.existsSync(source)) throw new Error(`source not found: ${source}`);
   const WORK_DIR = path.join(DATA_DIR, 'work');
-  const stageOpts = { root: DATA_DIR, workers: WORKERS, workerRamMb: WORKER_RAM_MB, keepChunks: KEEP_CHUNKS || VERIFY, allAmenities: ALL_AMENITY_VALUES, amenities };
+  const resumeMode = String(config.args['resume-mode'] ?? 'verify').toLowerCase();
+  if (!['trust', 'verify'].includes(resumeMode)) throw new Error('--resume-mode must be trust or verify');
+  const stageOpts = { root: DATA_DIR, workers: WORKERS, workerRamMb: WORKER_RAM_MB, keepChunks: KEEP_CHUNKS || VERIFY, allAmenities: ALL_AMENITY_VALUES, amenities, resumeMode };
   let priorManifest = null;
   try { priorManifest = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'manifest.json'), 'utf8')); } catch {}
   if (!source && STAGES.includes(0)) throw new Error('--source <file.pbf> is required for stage 0');
   if (source) {
     const sourceSize = fs.statSync(source).size;
-    const fingerprintProgress = createProgress('source fingerprint', sourceSize, logger);
-    let fingerprintBytes = 0;
-    const fingerprintWithProgress = async (file) => {
-      const h = createHash('sha256');
-      for await (const chunk of createReadStream(file)) { h.update(chunk); fingerprintBytes += chunk.length; fingerprintProgress(fingerprintBytes, fingerprintBytes >= sourceSize); }
-      fingerprintProgress(sourceSize, true);
-      return h.digest('hex');
-    };
-    stageOpts.sourceFingerprint = deps.sourceFingerprint ? await fingerprintFile(source) : await fingerprintWithProgress(source);
-    stageOpts.sourceMetadata = readSourceMetadata(source);
+    const trustSavedStage0 = resumeMode === 'trust' &&
+      typeof priorManifest?.sourceFingerprint === 'string' && priorManifest.sourceFingerprint.length > 0 && Array.isArray(priorManifest.chunks) &&
+      priorManifest.planetSource === path.resolve(source) && priorManifest.planetSizeBytes === sourceSize && priorManifest.chunkTargetMb === CHUNK_MB &&
+      (priorManifest.planetSourceModifiedMs === undefined || priorManifest.planetSourceModifiedMs === fs.statSync(source).mtimeMs);
+    if (trustSavedStage0) {
+      logger(`trusting ${priorManifest.complete === true ? 'completed' : 'partial'} stage 0 manifest from ${priorManifest.completedAt ?? priorManifest.createdAt ?? 'unknown date'}; source fingerprint and completed chunk contents will not be re-read`);
+      stageOpts.sourceFingerprint = priorManifest.sourceFingerprint;
+      stageOpts.sourceMetadata = { timestamp: priorManifest.sourceTimestamp ?? null, replication: priorManifest.replication ?? null };
+    } else {
+      if (resumeMode === 'trust') throw new Error('Cannot trust stage 0: the saved manifest is missing or does not match the source path, size, modification time, or chunk size. Choose verify mode and rerun stage 0.');
+      const fingerprintProgress = createProgress('source fingerprint', sourceSize, logger);
+      let fingerprintBytes = 0;
+      const fingerprintWithProgress = async (file) => {
+        const h = createHash('sha256');
+        for await (const chunk of createReadStream(file)) { h.update(chunk); fingerprintBytes += chunk.length; fingerprintProgress(fingerprintBytes, fingerprintBytes >= sourceSize); }
+        fingerprintProgress(sourceSize, true);
+        return h.digest('hex');
+      };
+      stageOpts.sourceFingerprint = deps.sourceFingerprint ? await fingerprintFile(source) : await fingerprintWithProgress(source);
+      stageOpts.sourceMetadata = readSourceMetadata(source);
+    }
     stageOpts.source = path.resolve(source);
   } else {
     if (!priorManifest?.sourceFingerprint || !Array.isArray(priorManifest.chunks)) throw new Error('source omitted and no work/manifest.json provenance is available');
@@ -507,7 +526,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (stage === 0) {
       if (!source) throw new Error('--source <file.pbf> is required for stage 0');
       if (!fs.existsSync(source)) throw new Error(`source not found: ${source}`);
-      const result = await stage0({ planetSource: source, fingerprint: stageOpts.sourceFingerprint, metadata: stageOpts.sourceMetadata, dataDir: DATA_DIR, chunkMb: CHUNK_MB, keepChunks: KEEP_CHUNKS || VERIFY, logger });
+      const result = await stage0({ planetSource: source, fingerprint: stageOpts.sourceFingerprint, metadata: stageOpts.sourceMetadata, dataDir: DATA_DIR, chunkMb: CHUNK_MB, keepChunks: KEEP_CHUNKS || VERIFY, resumeMode, logger });
       if (!result.complete) return;
     } else if (stage === 1) await stage1(stageOpts);
     else if (stage === 2) await stage2(stageOpts);
@@ -518,15 +537,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       if (current.sourceFingerprint !== stageOpts.sourceFingerprint) throw new Error('work manifest source differs from requested source; run stage 0 first');
       const chunkIds = current.chunks?.map((c) => c.id);
       if (!Array.isArray(chunkIds) || !chunkIds.length) throw new Error('work manifest has no expected chunks');
-      for (const n of [1, 2, 3]) await validateStageManifest(DATA_DIR, n, stageOpts.sourceFingerprint, chunkIds);
+      for (const n of [1, 2, 3]) await validateStageManifest(DATA_DIR, n, stageOpts.sourceFingerprint, chunkIds, { verifyIntegrity: resumeMode === 'verify' });
       const s1 = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'stage1/manifest.json'), 'utf8'));
       if (!s1.config?.allAmenities && stageOpts.amenities.some((value) => !(s1.config.amenities || []).includes(value))) throw new Error('Stage 4 amenity values were not retained by Stage 1; rerun stage 1 with those values or --all-amenity-values true');
-      await assemble({ pipelineDir: DATA_DIR, source: stageOpts.source, expectedChunkIds: chunkIds, amenities: stageOpts.amenities, shardPrecision: SHARD_PRECISION, ramMB: RAM_MB, sourceTimestamp: stageOpts.sourceMetadata.timestamp, sourceFingerprint: stageOpts.sourceFingerprint, replication: stageOpts.sourceMetadata.replication, logger });
+      await assemble({ pipelineDir: DATA_DIR, source: stageOpts.source, expectedChunkIds: chunkIds, amenities: stageOpts.amenities, shardPrecision: SHARD_PRECISION, ramMB: RAM_MB, sourceTimestamp: stageOpts.sourceMetadata.timestamp, sourceFingerprint: stageOpts.sourceFingerprint, replication: stageOpts.sourceMetadata.replication, resumeMode, logger });
     }
     if (aborted()) return;
   }
 
-  if (STAGES.includes(0) && VERIFY) {
+  if (VERIFY) {
     if (!source) throw new Error('--verify requires --source');
     if (!runVerify({ planetSource: source, chunksDir: path.join(WORK_DIR, 'chunks'), logger, countObjects: deps.countObjects ?? osmiumNumObjects })) process.exitCode = 1;
   }

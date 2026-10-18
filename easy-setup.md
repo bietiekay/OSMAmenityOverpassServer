@@ -176,6 +176,22 @@ launched again. If the source's `latest`
 URL changes during an interrupted download, use a matching fixed dated URL or
 move the old partial download aside before restarting that download.
 
+When stage 0 has a complete manifest, the wizard shows its completion date and
+the most recently completed work unit. The default resume choice trusts that
+manifest and the per-chunk done markers, skips the full planet and output
+hashes, and continues at the first incomplete stage or chunk. This is quickest
+when the retained source and pipeline have not been changed. Choose **no** to
+run the previous full verification, which rechecks the source, chunks, and
+completed outputs and may take hours. If Stage 0 itself was interrupted, the
+wizard offers the same choice when a partial manifest exists. Trust mode still
+scans PBF block headers to reconstruct the chunk plan, then reuses completed
+chunk markers without hashing their contents. Stages 1–3 skip completed
+chunks and reuse completed intermediate results. Stage 4 reuses completed
+amenity-chunk mappings and finished shards. If interrupted while building a
+node or way lookup, that lookup is rebuilt; if interrupted while counting
+unique objects, the counts are calculated again. The last unfinished mapping,
+shard, or counting step is repeated.
+
 For later operation, use the generated wrapper:
 
 ```bash

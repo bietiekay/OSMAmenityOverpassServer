@@ -149,9 +149,24 @@ For the exact accepted snapshot, main objects total 32,293 in 6,720 shards.
 
 ### Resume and additional amenity values
 
-After SIGINT/SIGTERM, rerun the same full command. Fingerprints and output
-checks preserve valid completed units. If chunks were deleted after stage 3,
-rerun stage 0 as part of the full command to recreate them. Stage 4 alone can
+After SIGINT/SIGTERM, Easy Setup asks how to resume when stage 0 is complete;
+it defaults to trusting manifests and per-unit done markers, skipping completed
+stages/chunks and continuing with unfinished work. Choosing verification runs
+the full source, chunk, and output hash checks. For direct CLI use, trust mode
+must be selected explicitly. If stage 0 is complete, skip it; if stage 0 is
+partial, include it to rescan PBF block headers while reusing completed chunks:
+
+```bash
+node scripts/extract.mjs --source /source/planet.osm.pbf --data-dir /osm \
+  --stages 1-4 --resume-mode trust
+```
+
+For an interrupted stage 0, use `--stages 0-4 --resume-mode trust`.
+
+The CLI defaults to verify mode. If stage 0 was interrupted or its source or
+chunk settings changed, rerun it with `--stages 0-4 --resume-mode verify`. If
+chunks were deleted after stage 3, rerun stage 0 as part of the full command to
+recreate them. Stage 4 alone can
 reuse valid stages 1–3 without chunks:
 
 ```bash
@@ -163,6 +178,12 @@ sudo -u osm-amenity node /opt/osm-amenity-server/scripts/extract.mjs \
 That requires stage 1 to have retained those values, for example through
 `--all-amenity-values true`. Stop the service before deliberately changing
 the served amenity set or precision, and update its environment to match.
+
+In trust mode, Stage 4 saves progress per amenity input chunk and per output
+shard. A restart reuses completed mappings and shards and repeats the first
+unfinished unit. An interrupted node or way lookup build is rebuilt as a
+whole; the final unique-object counting step also runs again if it had not
+finished.
 Direct stage activation rejects a snapshot older than an updated active
 generation. For a production configuration change after updates, build a
 separate pipeline from a suitable current source, validate it and its cursor,
