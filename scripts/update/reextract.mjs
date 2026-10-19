@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fetch as undiciFetch } from 'undici';
 import { main as runExtraction } from '../extract.mjs';
 import { buildIndex } from '../extract/assembly.mjs';
 import { applyDiffBatchGeneration } from './apply-generation.mjs';
@@ -94,7 +95,7 @@ async function buildCandidate({ pipelineDir, sourcePbf, amenities, shardPrecisio
 /** Build from a PBF in isolation, catch it up to the live namespace, then activate once. */
 export async function runReextract({
   dataDir, sourcePbf, amenities = ['toilets'], shardPrecision = 5, replication,
-  signal, fetchImpl = fetch, extraction = runExtraction, maxCatchupDiffs = MAX_CATCHUP_DIFFS,
+  signal, fetchImpl = undiciFetch, extraction = runExtraction, maxCatchupDiffs = MAX_CATCHUP_DIFFS,
   maxCatchupBytes = MAX_CATCHUP_BYTES, now = () => new Date().toISOString()
 }) {
   const pipelineDir = pipelineRoot(dataDir);

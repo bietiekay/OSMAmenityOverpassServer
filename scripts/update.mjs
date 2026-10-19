@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createReadStream } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { fetch as undiciFetch } from 'undici';
 import { loadConfig } from '../dist/config.js';
 import { fetchReplicationState, downloadDiff } from './update/replication.mjs';
 import { applyDiffGeneration } from './update/apply-generation.mjs';
@@ -82,7 +83,7 @@ export function createUpdateWorker({
   pipelineDir, replication, sourcePbf = null,
   amenities = ['toilets'], shardPrecision = 5, updateIntervalSeconds = 3600,
   reextractEverySeconds = 604800, reextractSourcePbf = null,
-  fetchImpl = fetch, fetchState = fetchReplicationState, download = downloadDiff,
+  fetchImpl = undiciFetch, fetchState = fetchReplicationState, download = downloadDiff,
   apply = applyDiffGeneration, checkReextract = maybeRunReextract,
   onLog = (message) => console.log(message), onError = (error) => console.error(error.stack ?? error),
   maxDiffs = MAX_DIFFS, maxDiffBytes = MAX_DIFF_BYTES

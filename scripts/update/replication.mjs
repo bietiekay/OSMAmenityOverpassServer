@@ -6,6 +6,7 @@ import { createWriteStream } from 'node:fs';
 import { PassThrough, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
+import { fetch as undiciFetch } from 'undici';
 import { parseStateTxt, iterateCatchUpSequences } from '../../dist/replication.js';
 
 const parts = (sequence) => String(sequence).padStart(9, '0').match(/.{3}/g);
@@ -27,14 +28,14 @@ export function stateUrl(replication) {
     : `${base}/${replication.interval}/state.txt`;
 }
 
-export async function fetchReplicationState(replication, fetchImpl = fetch, { signal } = {}) {
+export async function fetchReplicationState(replication, fetchImpl = undiciFetch, { signal } = {}) {
   const url = stateUrl(replication); const response = await fetchImpl(url, { signal, headers: { 'user-agent': 'osm-amenity-overpass-server' } });
   if (!response.ok) throw new Error(`replication state fetch failed: HTTP ${response.status} for ${url}`);
   return parseStateTxt(await response.text());
 }
 
 /** Stream a compressed diff to a temp path without keeping its bytes in memory. */
-export async function downloadDiff(replication, sequence, destination, { fetchImpl = fetch, maxBytes = 128 * 1024 * 1024, expectedMd5 = null, signal } = {}) {
+export async function downloadDiff(replication, sequence, destination, { fetchImpl = undiciFetch, maxBytes = 128 * 1024 * 1024, expectedMd5 = null, signal } = {}) {
   const url = sequenceUrl(replication, sequence); const response = await fetchImpl(url, { signal, headers: { 'user-agent': 'osm-amenity-overpass-server' } });
   if (!response.ok || !response.body) throw new Error(`replication diff fetch failed: HTTP ${response.status} for ${url}`);
   const temporary = `${destination}.${randomUUID()}.tmp`; await fs.mkdir(path.dirname(destination), { recursive: true });

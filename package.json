@@ -18,13 +18,14 @@
     "verify": "npm run lint && npm run build && npm test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "dependencies": {
     "@fastify/formbody": "^8.0.2",
     "fastify": "^5.6.2",
     "ngeohash": "^0.6.0",
-    "pino": "^10.1.0"
+    "pino": "^10.1.0",
+    "undici": "8.12.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",

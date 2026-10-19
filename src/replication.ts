@@ -2,6 +2,7 @@
  * namespace. Regional daily sequence numbers remain local and are not
  * converted to planet minute numbers. */
 import { promises as fs } from 'node:fs';
+import { fetch as undiciFetch } from 'undici';
 
 export type Granularity = 'minute' | 'day';
 
@@ -107,7 +108,7 @@ export function* iterateCatchUpSequences(lastSeq: number, currentSeq: number): G
 /** GET `<baseUrl>/minute/state.txt` and parse it. */
 export const fetchState = async (baseUrl: string, granularity: Granularity = 'minute'): Promise<ReplicationState> => {
   const url = `${baseUrl}/${granularity}/state.txt`;
-  const response = await fetch(url, { headers: { 'user-agent': 'osm-amenity-overpass-server' } });
+  const response = await undiciFetch(url, { headers: { 'user-agent': 'osm-amenity-overpass-server' } });
   if (!response.ok) {
     throw new Error(`state.txt fetch failed: HTTP ${response.status} for ${url}`);
   }
@@ -120,7 +121,7 @@ export const fetchState = async (baseUrl: string, granularity: Granularity = 'mi
  * optional) should use a chunked writer instead.
  */
 export const downloadFile = async (url: string, destination: string): Promise<number> => {
-  const response = await fetch(url, { headers: { 'user-agent': 'osm-amenity-overpass-server' } });
+  const response = await undiciFetch(url, { headers: { 'user-agent': 'osm-amenity-overpass-server' } });
   if (!response.ok) {
     throw new Error(`download failed: HTTP ${response.status} for ${url}`);
   }
