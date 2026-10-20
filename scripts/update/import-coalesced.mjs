@@ -1,14 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createReadStream, createWriteStream } from 'node:fs';
-import { once } from 'node:events';
-import { finished } from 'node:stream/promises';
+import { createReadStream } from 'node:fs';
 import readline from 'node:readline';
-import { deltaPartitionForKey } from './delta-store.mjs';
-import { sortWithProgress } from './progress-sort.mjs';
 
 const FILTER_BYTES = 64 * 1024 * 1024;
-const MAX_SPOOL_BYTES = 128 * 1024 * 1024 * 1024;
 const MAX_RELEVANT_BYTES = 128 * 1024 * 1024;
 const checkAborted = (signal) => { if (signal?.aborted) throw signal.reason ?? new Error('update aborted'); };
 const identity = (value) => `${value.type}:${value.id}`;
@@ -47,63 +42,39 @@ async function buildTrackedFilter(indexes, signal, onProgress) {
   return filter;
 }
 
-/** Scan final object events once, grouping all overlay writes by their disk partition. */
+/** Find changes affecting indexed amenities in an already partition-ordered stream. */
 export async function prepareCoalescedImport(coalesced, indexes, amenities, {
-  signal, onProgress = () => {}, maxObjectBytes = 8 * 1024 * 1024, maxSpoolBytes = MAX_SPOOL_BYTES, workers = 1
+  signal, onProgress = () => {}, maxObjectBytes = 8 * 1024 * 1024
 } = {}) {
-  const tempDir = path.dirname(coalesced.file);
-  const raw = path.join(tempDir, 'changes.by-partition.tsv');
-  const sorted = path.join(tempDir, 'changes.by-partition.sorted.tsv');
   const filter = await buildTrackedFilter(indexes, signal, onProgress);
   const relevant = [];
-  let completed = 0; let spoolBytes = 0; let relevantBytes = 0;
-  const writer = createWriteStream(raw, { flags: 'wx' });
-  try {
-    onProgress({ phase: 'partitioning coalesced changes', completed, total: coalesced.uniqueCount, unit: 'objects' });
-    const lines = readline.createInterface({ input: createReadStream(coalesced.file), crlfDelay: Infinity });
-    for await (const line of lines) {
-      checkAborted(signal);
-      const size = Buffer.byteLength(line);
-      if (size > maxObjectBytes) throw new Error('coalesced change exceeds update object byte limit');
-      const change = JSON.parse(line);
-      const key = identity(change);
-      const bucket = String(deltaPartitionForKey(key)).padStart(5, '0');
-      const row = `${bucket}\t${line}\n`;
-      spoolBytes += Buffer.byteLength(row);
-      if (spoolBytes > maxSpoolBytes) throw new Error(`partitioned diff spool exceeds ${maxSpoolBytes} bytes; use a newer baseline`);
-      if (!writer.write(row)) await once(writer, 'drain');
-      const configuredMain = amenities.includes(change.tags?.amenity);
-      if (configuredMain || filter.mightContain(key)) {
-        const tracked = configuredMain || (await indexes.objectCells.get(key)).length > 0 || (await indexes.reverseParents.get(key)).length > 0;
-        if (tracked) {
-          relevantBytes += size;
-          if (relevantBytes > MAX_RELEVANT_BYTES) throw new Error(`possibly affected update objects exceed ${MAX_RELEVANT_BYTES} bytes; use a smaller replication batch`);
-          relevant.push(change);
-        }
-        if (relevant.length > 100000) throw new Error('update has more than 100000 possibly affected objects; use a smaller replication batch');
+  let completed = 0; let relevantBytes = 0;
+  onProgress({ phase: 'identifying affected changes', completed, total: coalesced.uniqueCount, unit: 'objects' });
+  const lines = readline.createInterface({ input: createReadStream(coalesced.file), crlfDelay: Infinity });
+  for await (const line of lines) {
+    checkAborted(signal);
+    const divider = line.indexOf('\t');
+    if (divider < 1) throw new Error('invalid coalesced delta partition row');
+    const size = Buffer.byteLength(line) - divider - 1;
+    if (size > maxObjectBytes) throw new Error('coalesced change exceeds update object byte limit');
+    const change = JSON.parse(line.slice(divider + 1));
+    const key = identity(change);
+    const configuredMain = amenities.includes(change.tags?.amenity);
+    if (configuredMain || filter.mightContain(key)) {
+      const tracked = configuredMain || (await indexes.objectCells.get(key)).length > 0 || (await indexes.reverseParents.get(key)).length > 0;
+      if (tracked) {
+        relevantBytes += size;
+        if (relevantBytes > MAX_RELEVANT_BYTES) throw new Error(`possibly affected update objects exceed ${MAX_RELEVANT_BYTES} bytes; use a smaller replication batch`);
+        relevant.push(change);
       }
-      completed += 1;
-      if (completed % 10000 === 0) onProgress({ phase: 'partitioning coalesced changes', completed, total: coalesced.uniqueCount, unit: 'objects', detail: `${relevant.length.toLocaleString('en-US')} possibly affected objects` });
+      if (relevant.length > 100000) throw new Error('update has more than 100000 possibly affected objects; use a smaller replication batch');
     }
-    writer.end();
-    await finished(writer);
-    onProgress({ phase: 'partitioning coalesced changes', completed, total: coalesced.uniqueCount, unit: 'objects', detail: `${relevant.length.toLocaleString('en-US')} possibly affected objects` });
-    if (completed !== coalesced.uniqueCount) throw new Error(`coalesced file contains ${completed} objects, expected ${coalesced.uniqueCount}`);
-    await fs.rm(coalesced.file, { force: true });
-    await sortWithProgress(raw, sorted, ['-S', '64M', `--parallel=${workers}`, '-T', tempDir, '-t', '\t', '-k1,1'], {
-      signal,
-      detail: `${Math.round(spoolBytes / (1024 * 1024))} MiB grouped spool`,
-      onProgress: (event) => onProgress({ phase: 'sorting delta partitions', ...event })
-    });
-    await fs.rm(raw, { force: true });
-    return { file: sorted, relevant };
-  } catch (error) {
-    writer.destroy();
-    await finished(writer).catch(() => {});
-    await fs.rm(raw, { force: true });
-    await fs.rm(sorted, { force: true });
-    throw error;
+    completed += 1;
+    if (completed % 10000 === 0) onProgress({ phase: 'identifying affected changes', completed, total: coalesced.uniqueCount, unit: 'objects', detail: `${relevant.length.toLocaleString('en-US')} possibly affected objects` });
   }
+  onProgress({ phase: 'identifying affected changes', completed, total: coalesced.uniqueCount, unit: 'objects', detail: `${relevant.length.toLocaleString('en-US')} possibly affected objects` });
+  if (completed !== coalesced.uniqueCount) throw new Error(`coalesced file contains ${completed} objects, expected ${coalesced.uniqueCount}`);
+  return { file: coalesced.file, relevant };
 }
 
 async function settledWave(tasks) {
@@ -139,6 +110,7 @@ export async function importCoalescedPartitions(store, file, total, { workers = 
     if (divider < 1) throw new Error('invalid grouped delta spool row');
     const nextBucket = Number(line.slice(0, divider));
     if (!Number.isSafeInteger(nextBucket)) throw new Error('invalid grouped delta partition');
+    if (bucket !== null && nextBucket < bucket) throw new Error('grouped delta spool is not ordered by partition');
     if (bucket !== null && nextBucket !== bucket) await queueGroup();
     bucket = nextBucket;
     groupBytes += Buffer.byteLength(line);

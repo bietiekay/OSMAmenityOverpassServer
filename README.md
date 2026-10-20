@@ -164,31 +164,32 @@ server was behind. It does not skip replication sequences or remove the need to
 read and validate every diff. OsmChange `modify` entries replace the complete
 object, including its full tag set and way/relation references; they are not
 field-level patches. Coalescing therefore preserves the current state but does
-not retain intermediate object versions or their history. It uses an external
-disk sort with a 32 MiB sort-memory setting and allows up to 128 GiB of
-temporary TSV spool data under the update-diffs work directory; ensure free
-disk space for the spool and sort output. This reduces duplicate work but does
-not guarantee that a planet-scale update will catch up.
+not retain intermediate object versions or their history. One external disk
+sort orders changes by delta partition, typed object ID, and diff sequence.
+The reducer emits each final object already grouped for the delta store, so a
+second partition sort and spool are unnecessary. Sort memory is set to 32 MiB;
+the raw TSV spool is capped at 128 GiB. Leave room for the sorted copy and
+reduced output under the update-diffs work directory. This reduces duplicate
+work but does not guarantee that a planet-scale update will catch up.
 
 After coalescing, the updater runs independent baseline lookups and amenity
 geometry tasks concurrently, up to `OSM_AMENITY_UPDATE_WORKERS`. Each task
 resolves node, way, and relation dependencies against the same final object
 overlay. Completed geometry is merged in stable object-ID order, and a
 coordinator writes each affected shard once before validation and publication.
-For large batches, the updater also scans the coalesced objects sequentially,
-filters potentially affected keys using a bounded tracked-key filter, and groups
-all delta writes by disk partition. Each partition is written once, with
-different partitions processed concurrently up to the worker limit. The filter
-only skips index lookups for keys it can prove absent; it never suppresses a
-tracked change. The full delta overlay is still retained so later geometry
-references and future updates can resolve changed objects. Partitioning and
-grouped writes report object counts and phase ETAs.
+For large batches, the updater also scans the coalesced objects sequentially
+and filters potentially affected keys using a bounded tracked-key filter.
+The stream is already grouped by disk partition. Each partition is written
+once, with different partitions processed concurrently up to the worker limit.
+The filter only skips index lookups for keys it can prove absent; it never
+suppresses a tracked change. The full delta overlay is retained so later
+geometry references and future updates can resolve changed objects. The
+affected-change scan and grouped writes report object counts and phase ETAs.
 The setting is separate from initial extraction workers. More update workers
 increase concurrent `osmium cat` processes, temporary PBF files, RAM use, and
 disk I/O; compare full catch-up rates when tuning it.
-The grouped import writes another temporary spool of up to 128 GiB under the
-coalescing work directory, plus sort output while sorting. Leave space for
-these files in addition to the downloaded diffs and generation candidate.
+The grouped import reads the reduced spool directly; it does not write another
+copy of all changed objects.
 
 The line pipeline is partitioned and bounded in its lookups, but Japan success
 does not demonstrate planet-size runtime or resource bounds. Relations currently
@@ -213,10 +214,10 @@ While a catch-up is running, the updater emits a progress heartbeat about every
 download and parsing, baseline object resolution, shard rebuild, recount,
 validation, or disk sync), with a phase rate and ETA when a total is known.
 
-The two external sort phases show a byte-based percentage: the first half tracks
+The coalescing sort shows a byte-based percentage: the first half tracks
 input read by `sort`, the second half tracks sorted output written. Progress can
-pause near 50% while GNU `sort` merges temporary runs internally, so these
-phases deliberately show no ETA.
+pause near 50% while GNU `sort` merges temporary runs internally, so this
+phase deliberately shows no ETA.
 
 For a planet/minute feed, the backlog can only shrink if the sustained end-to-end
 processing rate exceeds one replication diff per minute; compare the reported

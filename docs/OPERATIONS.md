@@ -333,10 +333,10 @@ During a catch-up, look for `update progress:` heartbeat entries about every 30
 seconds. They report the current phase, phase throughput, and ETA when the phase
 has a known total.
 
-The coalesced-change and delta-partition sort phases report a byte-based
-percentage: 0–50% for reading input and 50–100% for writing sorted output.
+The coalescing sort reports a byte-based percentage: 0–50% for reading input
+and 50–100% for writing sorted output.
 GNU `sort` may spend time merging temporary runs around 50% with no visible
-percentage change. No ETA is shown for these two phases.
+percentage change. No ETA is shown for this phase.
 
 The updater processes contiguous diffs as one atomic batch, so `/api/status`
 keeps the old cursor until validation and publication finish.
@@ -347,11 +347,12 @@ lookups and geometry work repeatedly for intermediate versions; it does not
 skip any replication diff or sequence. Each OsmChange `modify` contains a full
 replacement object, so tags and member references are taken from the final
 version rather than merged field by field. Intermediate versions are omitted
-from the current-state index. The coalescing stage writes a TSV spool and
-externally sorts it with GNU `sort` (configured for 32 MiB sort memory),
-then streams the final per-object events into the update. Temporary spool data
-is capped at 128 GiB in `work/update-diffs`; the sort also needs room for its
-sorted output and temporary files, so check free space before a large catch-up.
+from the current-state index. One GNU `sort` pass (configured for 32 MiB sort
+memory) orders the TSV spool by delta partition, object ID, and diff sequence.
+The reducer writes final per-object events already in delta-partition order;
+there is no second partition sort. The raw spool is capped at 128 GiB in
+`work/update-diffs`. The sorted copy and reduced output need additional room,
+so check free space before a large catch-up.
 The cap is a safety limit, not a disk-space reservation. Coalescing may reduce
 later work substantially when many diffs touch the same objects, but reading,
 sorting, and reducing a planet backlog still costs time and disk I/O. It does
@@ -366,14 +367,13 @@ simultaneous `osmium cat` processes, temporary candidate PBFs, RAM use, and
 disk traffic. Start with 2–3 only if resources permit, then measure completed
 batch throughput and backlog reduction. Changing `server.env` takes effect
 when the updater process is restarted.
-The large coalesced-object import groups changes by delta partition and writes
-each partition once, with distinct partitions processed concurrently. A bounded
-filter built from the tracked-object indexes avoids reading both indexes for
-every untracked object. All changed objects remain in the delta overlay so
-later references and update cycles can resolve their latest versions. The
-partitioning and grouped-write phases report continuous object counts and ETAs.
-The temporary grouped spool is limited to 128 GiB and needs additional space
-for its sorted output; check the pipeline filesystem before a large catch-up.
+The large coalesced-object import reads changes already grouped by partition
+and writes each partition once, with distinct partitions processed concurrently.
+A bounded filter built from the tracked-object indexes avoids reading both
+indexes for every untracked object. All changed objects remain in the delta
+overlay so later references and update cycles can resolve their latest versions.
+The affected-change scan and grouped-write phases report continuous object
+counts and ETAs. The grouped import does not create another full-size spool.
 After a batch publishes, `update catch-up assessment:` reports its end-to-end
 rate, how far the feed advanced during the run, and whether the remaining
 backlog shrank or grew. For a planet/minute feed, the backlog must shrink over

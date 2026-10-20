@@ -158,9 +158,11 @@ the entire feed history. URLs use nine digits split into three groups. Regional
 URLs use the direct `*-updates` base; planet URLs append `/minute` when needed.
 
 Missing diffs are downloaded in order within count/disk budgets. A batch is
-parsed incrementally into a partitioned raw-object overlay. Version guards
-compare source and overlay versions; tombstones prevent deleted objects from
-reappearing through the baseline. All raw changes are staged before derived
+parsed incrementally, sorted once by delta partition and typed object ID, and
+reduced to the final event per object. The resulting stream is already grouped
+for the delta overlay; no second full-size sort or spool is needed. Version
+guards compare source and overlay versions; tombstones prevent deleted objects
+from reappearing through the baseline. All raw changes are staged before derived
 geometry, so references changed later in the same batch are visible during
 reconstruction.
 

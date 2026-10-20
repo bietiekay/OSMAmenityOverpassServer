@@ -470,7 +470,7 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
       let changedCount = 0;
       const changedIds = new Map();
       const prepared = await prepareCoalescedImport(coalesced, indexes, amenities, {
-        signal, onProgress: reportProgress, maxObjectBytes: maxBatchBytes, workers
+        signal, onProgress: reportProgress, maxObjectBytes: maxBatchBytes
       });
       const relevant = [];
       for (const item of prepared.relevant) {
