@@ -27,6 +27,24 @@ const readUpdateWorkers = (value) => {
   return count;
 };
 
+const lookupNeedsSmallerBatch = (error) =>
+  /(?:source candidate blocks require|source lookup result exceeds).*request a smaller lookup batch/.test(error.message);
+
+/** Keep baseline PBF lookups within both the candidate-block and output limits. */
+async function resolveBaselineBatch(source, requests) {
+  try {
+    return (await source.resolveObjects(requests, {
+      maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024
+    })).objects;
+  } catch (error) {
+    if (!lookupNeedsSmallerBatch(error) || requests.length <= 1) throw error;
+    const middle = Math.floor(requests.length / 2);
+    const first = await resolveBaselineBatch(source, requests.slice(0, middle));
+    const second = await resolveBaselineBatch(source, requests.slice(middle));
+    return [...first, ...second];
+  }
+}
+
 /** Finish every task in a wave before returning an error, so shared readers stay open. */
 async function settledWave(tasks) {
   const results = await Promise.allSettled(tasks);
@@ -99,7 +117,7 @@ async function resolveMany(store, source, requests, onProgress = () => {}, progr
     try {
       return await resolveCurrentObjects(store, source, part, { maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024, validateOverlays: true });
     } catch (error) {
-      if (!/source candidate blocks require .* request a smaller lookup batch/.test(error.message) || part.length <= 1) throw error;
+      if (!lookupNeedsSmallerBatch(error) || part.length <= 1) throw error;
       const middle = Math.floor(part.length / 2);
       const first = await resolveBounded(part.slice(0, middle));
       const second = await resolveBounded(part.slice(middle));
@@ -465,10 +483,8 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
         checkAborted(signal);
         const parts = [];
         for (let j = i; j < Math.min(i + REF_BATCH * workers, relevant.length); j += REF_BATCH) parts.push(relevant.slice(j, j + REF_BATCH));
-        const baselines = await settledWave(parts.map((part) => source.resolveObjects(part.map(({ type, id }) => ({ type, id })), {
-          maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024
-        })));
-        for (const baseline of baselines) for (const object of baseline.objects) baselineVersions.set(ID(object.type, object.id), object.version);
+        const baselines = await settledWave(parts.map((part) => resolveBaselineBatch(source, part.map(({ type, id }) => ({ type, id })))));
+        for (const baseline of baselines) for (const object of baseline) baselineVersions.set(ID(object.type, object.id), object.version);
         reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: Math.min(i + REF_BATCH * workers, relevant.length), total: relevant.length, unit: 'objects', detail: `${baselineVersions.size.toLocaleString('en-US')} baseline objects resolved with ${workers} workers` });
       }
       for (const item of relevant) {
