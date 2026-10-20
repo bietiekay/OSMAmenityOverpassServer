@@ -47,8 +47,9 @@ export async function sortWithProgress(input, output, args, { signal, onProgress
       else reject(signal?.aborted ? signal.reason ?? new Error('update sort aborted') : new Error(`sort failed (${code ?? childSignal}): ${stderr}`));
     });
   });
-  const inputDone = pipeline(createReadStream(input), countInput, child.stdin, { signal }).catch((error) => { abort(); throw error; });
-  const outputDone = pipeline(child.stdout, countOutput, createWriteStream(output, { flags: 'wx' }), { signal }).catch((error) => { abort(); throw error; });
+  const pipelineOptions = signal ? { signal } : {};
+  const inputDone = pipeline(createReadStream(input), countInput, child.stdin, pipelineOptions).catch((error) => { abort(); throw error; });
+  const outputDone = pipeline(child.stdout, countOutput, createWriteStream(output, { flags: 'wx' }), pipelineOptions).catch((error) => { abort(); throw error; });
   try {
     const results = await Promise.allSettled([inputDone, outputDone, childDone]);
     const failed = results.find((result) => result.status === 'rejected');

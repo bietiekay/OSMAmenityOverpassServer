@@ -276,15 +276,34 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
     onProgress({ phase: 'reading existing affected shards', completed: scannedOldCells, total: oldCells.size, unit: 'shards' });
   }
   const changedIds = changes.map((o) => ({ type: o.type, id: o.id }));
-  onProgress({ phase: 'resolving changed objects against baseline PBF', completed: 0, total: changedIds.length, unit: 'objects' });
-  const changedCurrent = await resolveMany(store, source, changedIds, onProgress, 'resolving changed objects against baseline PBF', workers);
+  const changedKeys = new Set(changedIds.map(({ type, id }) => ID(type, id)));
+  const changedCurrent = new Map();
+  let changedBytes = 0;
+  const changedPhase = 'loading baseline-validated changes from delta overlay';
+  // These versions already beat both the existing overlay and the baseline PBF,
+  // and the grouped import has persisted them. Rechecking the PBF here repeats
+  // the most expensive lookup phase without changing version precedence.
+  onProgress({ phase: changedPhase, completed: 0, total: changes.length, unit: 'objects' });
+  for (let i = 0; i < changes.length; i += 1) {
+    checkAborted(signal);
+    const change = changes[i];
+    const current = await store.get(change.type, change.id);
+    if (!current || current.version !== change.version) throw new Error(`validated change ${ID(change.type, change.id)} was not stored at version ${change.version}`);
+    if (!current.deleted) {
+      changedBytes += Buffer.byteLength(JSON.stringify(current));
+      if (changedBytes > MAX_RESOLVED_BYTES) throw new Error(`resolved object cache exceeds ${MAX_RESOLVED_BYTES} bytes; reduce the update batch`);
+      changedCurrent.set(ID(change.type, change.id), current);
+    }
+    if ((i + 1) % 100 === 0 || i + 1 === changes.length) onProgress({ phase: changedPhase, completed: i + 1, total: changes.length, unit: 'objects' });
+  }
   const mainIds = new Set(oldMainIds);
   for (const change of changes) {
     const raw = changedCurrent.get(ID(change.type, change.id));
     if (raw?.tags?.amenity && amenities.includes(raw.tags.amenity)) mainIds.add(ID(raw.type, raw.id));
   }
   const mainRequests = [...mainIds].map((key) => { const [type, id] = key.split(':'); return { type, id: Number(id) }; });
-  const currentMains = await resolveMany(store, source, mainRequests, onProgress, 'resolving affected amenities against baseline PBF', workers);
+  const currentMains = await resolveMany(store, source, mainRequests.filter(({ type, id }) => !changedKeys.has(ID(type, id))), onProgress, 'resolving affected amenities against baseline PBF', workers);
+  for (const key of mainIds) if (changedCurrent.has(key)) currentMains.set(key, changedCurrent.get(key));
   const newRows = new Map(); let buildBytes = 0;
   const estimatedBytes = (element) => Buffer.byteLength(JSON.stringify({ ...element, memberCoords: [...element.memberCoords] }));
   const addToCell = (cell, element) => {

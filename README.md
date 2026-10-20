@@ -177,6 +177,10 @@ geometry tasks concurrently, up to `OSM_AMENITY_UPDATE_WORKERS`. Each task
 resolves node, way, and relation dependencies against the same final object
 overlay. Completed geometry is merged in stable object-ID order, and a
 coordinator writes each affected shard once before validation and publication.
+Relevant changes are compared with the retained baseline PBF once. After the
+grouped delta import, those validated versions are loaded from the overlay for
+the shard rebuild; unchanged dependencies still use version-aware baseline
+resolution.
 For large batches, the updater also scans the coalesced objects sequentially
 and filters potentially affected keys using a bounded tracked-key filter.
 The stream is already grouped by disk partition. Each partition is written

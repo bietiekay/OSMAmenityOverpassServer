@@ -1,11 +1,24 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { catchUpSequenceList, downloadFile, fetchState, fileUrl, iterateCatchUpSequences, minuteFileUrl, parseStateTxt } from '../src/replication.js';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 
-afterEach(() => vi.unstubAllGlobals());
+async function localFeed(status = 200) {
+  const requests: string[] = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.url ?? '');
+    response.writeHead(status);
+    response.end(request.url?.endsWith('state.txt') ? STATE_V2 : Buffer.from([1, 2, 3]));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('local replication feed has no TCP port');
+  return { baseUrl: `http://127.0.0.1:${address.port}`,
+    requests, close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) };
+}
 
 const STATE_V2 = `#version=2
 sequenceNumber=7327518
@@ -112,21 +125,20 @@ describe('replication requests', () => {
   it('fetches state and downloads a file, preserving response bytes', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'replication-test-'));
     const target = path.join(dir, 'diff.osc.gz');
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: true, text: async () => STATE_V2 })
-      .mockResolvedValueOnce({ ok: true, arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer });
-    vi.stubGlobal('fetch', fetchMock);
+    const feed = await localFeed();
     try {
-      expect((await fetchState('https://regional', 'day')).sequenceNumber).toBe(7327518);
-      expect(fetchMock.mock.calls[0][0]).toBe('https://regional/day/state.txt');
-      expect(await downloadFile('https://regional/day/001/002/003.osc.gz', target)).toBe(3);
+      expect((await fetchState(feed.baseUrl, 'day')).sequenceNumber).toBe(7327518);
+      expect(await downloadFile(`${feed.baseUrl}/day/001/002/003.osc.gz`, target)).toBe(3);
+      expect(feed.requests).toEqual(['/day/state.txt', '/day/001/002/003.osc.gz']);
       expect([...readFileSync(target)]).toEqual([1, 2, 3]);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally { await feed.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('reports HTTP failures for state and diff downloads', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 503 }));
-    await expect(fetchState('https://regional')).rejects.toThrow(/HTTP 503/);
-    await expect(downloadFile('https://regional/diff', '/tmp/unwritten-diff')).rejects.toThrow(/HTTP 503/);
+    const feed = await localFeed(503);
+    try {
+      await expect(fetchState(feed.baseUrl)).rejects.toThrow(/HTTP 503/);
+      await expect(downloadFile(`${feed.baseUrl}/diff`, '/tmp/unwritten-diff')).rejects.toThrow(/HTTP 503/);
+    } finally { await feed.close(); }
   });
 });
