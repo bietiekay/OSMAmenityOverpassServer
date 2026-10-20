@@ -143,7 +143,7 @@ const packRange = (r) => {
 const unpackRange = (b) => ({ min: b.readBigInt64LE(0), max: b.readBigInt64LE(8), offset: Number(b.readBigInt64LE(16)), headerLen: b.readUInt32LE(24), blobLen: b.readUInt32LE(28) });
 
 /** Build one compact per-type range index by sequentially decoding PBF blobs. */
-export async function buildSourceBlockIndex(sourcePbf, indexDir, { sourceFingerprint = null } = {}) {
+export async function buildSourceBlockIndex(sourcePbf, indexDir, { sourceFingerprint = null, onProgress = () => {} } = {}) {
   await fs.rm(indexDir, { recursive: true, force: true }); await fs.mkdir(indexDir, { recursive: true });
   const input = await open(sourcePbf, 'r');
   const outputs = Object.fromEntries(await Promise.all(TYPES.map(async (t) => [t, await open(typePath(indexDir, t), 'w')])));
@@ -151,6 +151,7 @@ export async function buildSourceBlockIndex(sourcePbf, indexDir, { sourceFingerp
   const hash = createHash('sha256'); let offset = 0, headerBlock = null, blocks = 0;
   try {
     const stat = await input.stat();
+    onProgress({ phase: 'building baseline PBF block index', completed: 0, total: stat.size, unit: 'bytes', detail: path.basename(sourcePbf) });
     const statIdentity = sourceIdentity(await input.stat({ bigint: true }));
     while (offset < stat.size) {
       const block = await readBlock(input, offset); blocks++;
@@ -167,6 +168,7 @@ export async function buildSourceBlockIndex(sourcePbf, indexDir, { sourceFingerp
         }
       }
       offset = block.next;
+      onProgress({ phase: 'building baseline PBF block index', completed: offset, total: stat.size, unit: 'bytes', detail: `${blocks.toLocaleString('en-US')} PBF blocks scanned` });
     }
     if (!headerBlock) throw new Error('PBF has no OSMHeader block');
     const finalIdentity = sourceIdentity(await input.stat({ bigint: true }));
@@ -266,7 +268,7 @@ export async function openSourceBlockIndex(indexDir, { sourcePbf = null, expecte
 }
 
 /** Build reverse edges and object-to-cell locations only for records in shards. */
-export async function buildTrackedIndexes(dataDir, indexDir, partitions = null) {
+export async function buildTrackedIndexes(dataDir, indexDir, partitions = null, onProgress = () => {}) {
   const manifest = JSON.parse(await fs.readFile(path.join(dataDir, 'manifest.json'), 'utf8'));
   const shardNames = Array.isArray(manifest.shards) ? manifest.shards : (await fs.readdir(path.join(dataDir, 'shards'))).filter((n) => n.endsWith('.bin')).map((n) => n.slice(0, -4)).sort();
   let shardBytes = 0;
@@ -275,12 +277,18 @@ export async function buildTrackedIndexes(dataDir, indexDir, partitions = null) 
   // routing up front so no large bucket is ever materialized without a bound.
   partitions ??= partitionCountForBytes(shardBytes * 8, 2 * 1024 * 1024);
   const cellRows = async function* () {
+    let completed = 0;
+    onProgress({ phase: 'building object-to-cell index', completed, total: shardNames.length, unit: 'shards' });
     for (const cell of shardNames) {
       const shard = readShard(await fs.readFile(path.join(dataDir, 'shards', `${cell.replace(/\.bin$/, '')}.bin`)));
       for (const element of shard.elements) yield { key: `${element.type}:${element.id}`, value: cell };
+      completed += 1;
+      onProgress({ phase: 'building object-to-cell index', completed, total: shardNames.length, unit: 'shards' });
     }
   };
   const parentRows = async function* () {
+    let completed = 0;
+    onProgress({ phase: 'building reverse-parent index', completed, total: shardNames.length, unit: 'shards' });
     for (const cell of shardNames) {
       const shard = readShard(await fs.readFile(path.join(dataDir, 'shards', `${cell.replace(/\.bin$/, '')}.bin`)));
       for (const element of shard.elements) {
@@ -288,6 +296,8 @@ export async function buildTrackedIndexes(dataDir, indexDir, partitions = null) 
         if (element.type === 'way') for (const id of element.nodeIds) yield { key: `node:${id}`, value: parent };
         else if (element.type === 'relation') for (const m of element.members) if (m.type === 'node' || m.type === 'way' || m.type === 'relation') yield { key: `${m.type}:${m.ref}`, value: parent };
       }
+      completed += 1;
+      onProgress({ phase: 'building reverse-parent index', completed, total: shardNames.length, unit: 'shards' });
     }
   };
   await createPartitionedMultiIndex(indexDir, 'object-cells', cellRows(), { partitions });

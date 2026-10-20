@@ -172,6 +172,19 @@ Retain the baseline PBF unchanged while it serves updates; provide a newer
 snapshot through a separate re-extract path. Old immutable generations currently
 require operator-managed retention and disk capacity.
 
+While a catch-up is running, the updater emits a progress heartbeat about every
+30 seconds. Logs identify the current phase (source-PBF hashing/indexing, diff
+download and parsing, baseline object resolution, shard rebuild, recount,
+validation, or disk sync), with a phase rate and ETA when a total is known. For a
+planet/minute feed, the backlog can only shrink if the sustained end-to-end
+processing rate exceeds one replication diff per minute; compare the reported
+diff-processing rate across several log entries. Phase ETAs are estimates for
+that phase, not a promise for the complete update. The active replication cursor
+is still published only after the whole batch validates and activates. After
+publication, a catch-up assessment reports the completed batch rate and how much
+the feed advanced during the run. If diffs remain, the updater starts another
+catch-up cycle immediately instead of waiting for the regular hourly check.
+
 ## Docker packaging
 
 The runner uses `node:22-bookworm-slim` and installs Debian's `osmium-tool`,

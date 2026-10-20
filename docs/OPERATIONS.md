@@ -329,6 +329,21 @@ Monitor these together:
 - Free space and inode availability in the pipeline/source filesystems.
 - HTTP error rate, process RSS, extraction/rebuild duration, and proxy fallback.
 
+During a catch-up, look for `update progress:` heartbeat entries about every 30
+seconds. They report the current phase, phase throughput, and ETA when the phase
+has a known total. The updater processes contiguous diffs as one atomic batch,
+so `/api/status` keeps the old cursor until validation and publication finish.
+After a batch publishes, `update catch-up assessment:` reports its end-to-end
+rate, how far the feed advanced during the run, and whether the remaining
+backlog shrank or grew. For a planet/minute feed, the backlog must shrink over
+successive runs; if it grows, processing is slower than the feed. Individual
+phase ETAs do not include later phases such as recount, validation, and disk
+sync. When the assessment finds remaining diffs, the updater now starts another
+catch-up cycle immediately instead of waiting an hour. If the backlog still
+grows across cycles, a newer correctly timestamped and replication-seeded
+baseline is needed; adding extraction workers will not make the updater catch
+up.
+
 For Japan, `osm_osm_change: "0"` is intentional; use the regional cursor in
 `localEngine.replication`. Unknown metadata is omitted rather than fabricated.
 The first update may scan/hash the full retained PBF to construct source lookup

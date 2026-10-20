@@ -40,7 +40,7 @@ async function countLines(file) {
 }
 
 /** Recompute exact global unique-object and shard-record counts with external sort. */
-async function recountManifest(generation, manifest, amenities) {
+async function recountManifest(generation, manifest, amenities, onProgress = () => {}) {
   const temp = path.join(generation, `.counts-${process.pid}-${Date.now()}`);
   await fs.mkdir(temp, { recursive: true });
   const mainRaw = path.join(temp, 'main.raw'); const supportRaw = path.join(temp, 'support.raw');
@@ -49,6 +49,8 @@ async function recountManifest(generation, manifest, amenities) {
   let shardRecords = 0;
   const write = async (stream, value) => { if (!stream.write(`${value}\n`)) await new Promise((resolve, reject) => { stream.once('drain', resolve); stream.once('error', reject); }); };
   try {
+    let completed = 0;
+    onProgress({ phase: 'recounting output shards', completed, total: manifest.shards.length, unit: 'shards' });
     for (const cellValue of manifest.shards) {
       const cell = String(cellValue).replace(/\.bin$/, '');
       const bytes = await fs.readFile(path.join(generation, 'shards', `${cell}.bin`));
@@ -58,20 +60,26 @@ async function recountManifest(generation, manifest, amenities) {
         const line = `${element.type}:${element.id}`;
         await write(element.tags?.amenity && amenities.includes(element.tags.amenity) ? mainStream : supportStream, line);
       }
+      completed += 1;
+      onProgress({ phase: 'recounting output shards', completed, total: manifest.shards.length, unit: 'shards' });
     }
   } finally {
     mainStream.end(); supportStream.end();
     await Promise.all([finished(mainStream), finished(supportStream)]);
   }
   try {
-    await Promise.all([sortUniqueFile(mainRaw, mainOut), sortUniqueFile(supportRaw, supportOut)]);
+    onProgress({ phase: 'sorting manifest object counts', completed: 0, total: 2, unit: 'sorts' });
+    await sortUniqueFile(mainRaw, mainOut);
+    onProgress({ phase: 'sorting manifest object counts', completed: 1, total: 2, unit: 'sorts', detail: 'main amenity objects sorted' });
+    await sortUniqueFile(supportRaw, supportOut);
+    onProgress({ phase: 'sorting manifest object counts', completed: 2, total: 2, unit: 'sorts', detail: 'support objects sorted' });
     const mainUnique = await countLines(mainOut); const supportObjects = await countLines(supportOut);
     manifest.totalElements = mainUnique;
     manifest.counts = { ...(manifest.counts ?? {}), mainUnique, supportObjects, shardRecords, duplicatedRecords: shardRecords - mainUnique - supportObjects };
   } finally { await fs.rm(temp, { recursive: true, force: true }); }
 }
 
-async function resolveMany(store, source, requests) {
+async function resolveMany(store, source, requests, onProgress = () => {}, progressPhase = 'resolving objects from baseline PBF') {
   const resolved = new Map();
   let totalBytes = 0;
   const resolveBounded = async (part) => {
@@ -86,6 +94,7 @@ async function resolveMany(store, source, requests) {
       return first;
     }
   };
+  onProgress({ phase: progressPhase, completed: 0, total: requests.length, unit: 'objects' });
   for (let i = 0; i < requests.length; i += REF_BATCH) {
     const part = requests.slice(i, i + REF_BATCH);
     const result = await resolveBounded(part);
@@ -96,6 +105,7 @@ async function resolveMany(store, source, requests) {
         resolved.set(key, value);
       }
     }
+    onProgress({ phase: progressPhase, completed: Math.min(i + part.length, requests.length), total: requests.length, unit: 'objects', detail: `${resolved.size.toLocaleString('en-US')} objects resolved` });
   }
   return resolved;
 }
@@ -116,22 +126,27 @@ function mergeCellElement(map, element) {
   }
 }
 
-async function affectedClosure(changes, reverseParents) {
+async function affectedClosure(changes, reverseParents, onProgress = () => {}) {
   const seen = new Set(changes.map((o) => ID(o.type, o.id))); const queue = [...seen];
+  let visited = 0;
+  onProgress({ phase: 'finding affected objects and parent dependencies', completed: 0, total: null, unit: 'objects' });
   while (queue.length) {
     const current = queue.pop();
     for (const parent of await reverseParents.get(current)) {
       if (!seen.has(parent)) { seen.add(parent); queue.push(parent); }
       if (seen.size > MAX_AFFECTED) throw new Error(`update dependency closure exceeds ${MAX_AFFECTED} OSM objects; split the update batch`);
     }
+    visited += 1;
+    if (visited % 1000 === 0) onProgress({ phase: 'finding affected objects and parent dependencies', completed: visited, total: null, unit: 'objects', detail: `${seen.size.toLocaleString('en-US')} objects in dependency closure` });
   }
+  onProgress({ phase: 'finding affected objects and parent dependencies', completed: visited, total: null, unit: 'objects', detail: `${seen.size.toLocaleString('en-US')} objects in dependency closure` });
   return seen;
 }
 
-async function buildMainGeometry(raw, store, source, elementCache, signal) {
+async function buildMainGeometry(raw, store, source, elementCache, signal, onProgress) {
   const resolve = async (type, id) => {
     const key = ID(type, id); if (elementCache.has(key)) return elementCache.get(key);
-    const found = await resolveMany(store, source, [{ type, id }]); const value = found.get(key) ?? null; elementCache.set(key, value); return value;
+    const found = await resolveMany(store, source, [{ type, id }], onProgress); const value = found.get(key) ?? null; elementCache.set(key, value); return value;
   };
   const requireObject = async (type, id, parent) => {
     const value = await resolve(type, id);
@@ -144,7 +159,7 @@ async function buildMainGeometry(raw, store, source, elementCache, signal) {
   };
   const addWay = async (wayRaw, parent) => {
     const way = shardElement(wayRaw);
-    const nodes = await resolveMany(store, source, way.nodeIds.map((id) => ({ type: 'node', id })));
+    const nodes = await resolveMany(store, source, way.nodeIds.map((id) => ({ type: 'node', id })), onProgress);
     for (const id of way.nodeIds) {
       checkAborted(signal);
       const node = nodes.get(ID('node', id)) ?? await requireObject('node', id, parent);
@@ -187,12 +202,18 @@ async function buildMainGeometry(raw, store, source, elementCache, signal) {
     : cellsIntersectingBbox(south, west, north, east, Number(elementCache.precision)) };
 }
 
-async function applyAcceptedChanges(generation, changes, store, source, indexes, amenities, precision, buildSequence, signal) {
+async function applyAcceptedChanges(generation, changes, store, source, indexes, amenities, precision, buildSequence, signal, onProgress = () => {}) {
   checkAborted(signal);
   if (!changes.length) return [];
-  const affected = await affectedClosure(changes, indexes.reverseParents);
+  const affected = await affectedClosure(changes, indexes.reverseParents, onProgress);
   const oldCells = new Set();
-  for (const key of affected) for (const cell of await indexes.objectCells.get(key)) oldCells.add(cell.replace(/\.bin$/, ''));
+  let checkedObjects = 0;
+  for (const key of affected) {
+    for (const cell of await indexes.objectCells.get(key)) oldCells.add(cell.replace(/\.bin$/, ''));
+    checkedObjects += 1;
+    if (checkedObjects % 1000 === 0) onProgress({ phase: 'finding affected shards', completed: checkedObjects, total: affected.size, unit: 'objects', detail: `${oldCells.size.toLocaleString('en-US')} shards found` });
+  }
+  onProgress({ phase: 'finding affected shards', completed: checkedObjects, total: affected.size, unit: 'objects', detail: `${oldCells.size.toLocaleString('en-US')} shards found` });
   if (oldCells.size > MAX_CELLS) throw new Error(`update touches more than ${MAX_CELLS} old cells; split the update batch`);
 
   const oldMainIds = new Set();
@@ -204,6 +225,8 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
     if (bytes.length > 256 * 1024 * 1024) throw new Error(`shard ${cell} exceeds 256 MiB update budget; increase shard precision`);
     return readShard(bytes).elements;
   };
+  let scannedOldCells = 0;
+  onProgress({ phase: 'reading existing affected shards', completed: 0, total: oldCells.size, unit: 'shards' });
   for (const cell of oldCells) {
     const elements = await readCell(cell);
     oldRecordCount += elements.length;
@@ -211,16 +234,19 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
       if (amenities.includes(element.tags.amenity)) oldMainIds.add(ID(element.type, element.id));
       else oldSupportIds.add(ID(element.type, element.id));
     }
+    scannedOldCells += 1;
+    onProgress({ phase: 'reading existing affected shards', completed: scannedOldCells, total: oldCells.size, unit: 'shards' });
   }
   const changedIds = changes.map((o) => ({ type: o.type, id: o.id }));
-  const changedCurrent = await resolveMany(store, source, changedIds);
+  onProgress({ phase: 'resolving changed objects against baseline PBF', completed: 0, total: changedIds.length, unit: 'objects' });
+  const changedCurrent = await resolveMany(store, source, changedIds, onProgress, 'resolving changed objects against baseline PBF');
   const mainIds = new Set(oldMainIds);
   for (const change of changes) {
     const raw = changedCurrent.get(ID(change.type, change.id));
     if (raw?.tags?.amenity && amenities.includes(raw.tags.amenity)) mainIds.add(ID(raw.type, raw.id));
   }
   const mainRequests = [...mainIds].map((key) => { const [type, id] = key.split(':'); return { type, id: Number(id) }; });
-  const currentMains = await resolveMany(store, source, mainRequests);
+  const currentMains = await resolveMany(store, source, mainRequests, onProgress, 'resolving affected amenities against baseline PBF');
   const cache = new Map(currentMains); cache.precision = precision;
   const newRows = new Map(); let buildBytes = 0;
   const estimatedBytes = (element) => Buffer.byteLength(JSON.stringify({ ...element, memberCoords: [...element.memberCoords] }));
@@ -236,15 +262,19 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
     const after = estimatedBytes(existing); buildBytes += after - before;
     if (buildBytes > MAX_REBUILD_BYTES) throw new Error(`affected shard rebuild exceeds ${MAX_REBUILD_BYTES} estimated bytes; split the update batch`);
   };
+  let geometryCompleted = 0;
+  onProgress({ phase: 'rebuilding affected amenity geometry', completed: 0, total: mainIds.size, unit: 'amenities' });
   for (const key of mainIds) {
     checkAborted(signal);
     const raw = currentMains.get(key);
     if (!raw || !amenities.includes(raw.tags?.amenity)) continue;
-    const located = await buildMainGeometry(raw, store, source, cache, signal);
+    const located = await buildMainGeometry(raw, store, source, cache, signal, onProgress);
     for (const cell of located.cells) {
       addToCell(cell, located.main);
       for (const helper of located.helpers) addToCell(cell, helper);
     }
+    geometryCompleted += 1;
+    onProgress({ phase: 'rebuilding affected amenity geometry', completed: geometryCompleted, total: mainIds.size, unit: 'amenities' });
   }
   if (newRows.size + oldCells.size > MAX_CELLS) throw new Error(`update touches more than ${MAX_CELLS} total cells; split the update batch`);
 
@@ -252,6 +282,8 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
   for (const cell of newRows.keys()) if (!oldCells.has(cell)) oldRecordCount += (await readCell(cell)).length;
   const configHash = Buffer.from(JSON.parse(await fs.readFile(path.join(generation, 'manifest.json'), 'utf8')).configHash, 'hex');
   let newRecordCount = 0;
+  let rebuiltCells = 0;
+  onProgress({ phase: 'writing affected shards', completed: 0, total: touched.size, unit: 'shards' });
   for (const cell of touched) {
     const elements = new Map();
     for (const element of await readCell(cell)) if (!affected.has(ID(element.type, element.id))) elements.set(ID(element.type, element.id), element);
@@ -275,16 +307,24 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
     }
     for (const key of elements.keys()) if (!needed.has(key)) elements.delete(key);
     const file = path.join(generation, 'shards', `${cell}.bin`);
-    if (!elements.size) { await fs.rm(file, { force: true }); continue; }
+    if (!elements.size) {
+      await fs.rm(file, { force: true });
+      rebuiltCells += 1;
+      onProgress({ phase: 'writing affected shards', completed: rebuiltCells, total: touched.size, unit: 'shards' });
+      continue;
+    }
     newRecordCount += elements.size;
     const output = writeShard(cell, [...elements.values()], buildSequence, configHash);
     if (output.length > 256 * 1024 * 1024) throw new Error(`updated shard ${cell} exceeds 256 MiB; increase shard precision`);
     await atomicWrite(file, output);
     readShard(output);
+    rebuiltCells += 1;
+    onProgress({ phase: 'writing affected shards', completed: rebuiltCells, total: touched.size, unit: 'shards' });
   }
 
   // Append only new edges. Old edges remain as a safe over-approximation; this
   // can trigger extra work but never misses a newly introduced dependency.
+  onProgress({ phase: 'updating dependency indexes', completed: 0, total: null, unit: 'steps' });
   const cellRows = []; const parentRows = [];
   for (const [cell, rows] of newRows) for (const element of rows.values()) {
     cellRows.push({ key: ID(element.type, element.id), value: cell });
@@ -311,22 +351,30 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
   sequence, replication, dataTimestamp = null, amenities = ['toilets'], shardPrecision = 5, engine = null,
   maxBatchObjects = 2000, maxBatchBytes = 8 * 1024 * 1024, beforePublish = null,
   sourcePbf: sourcePbfOverride = null, sourcePbfFingerprint = null, diffFiles = null,
-  candidateGenerationDir = null, fromSequence = null, signal = null
+  candidateGenerationDir = null, fromSequence = null, signal = null, onProgress = () => {}
 }) {
   checkAborted(signal);
   if (!Number.isSafeInteger(sequence) || sequence <= 0) throw new Error('valid target sequence is required');
+  const inputs = diffFiles ?? [diffFile];
+  if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('at least one replication diff file is required');
+  let completedDiffs = 0;
+  const reportProgress = (event) => onProgress({ ...event, batchCompletedDiffs: completedDiffs, batchTotalDiffs: inputs.length });
   const overridePath = sourcePbfOverride ? path.resolve(sourcePbfOverride) : null;
   let actualOverrideFingerprint = sourcePbfFingerprint;
   if (sourcePbfOverride) {
     if (!actualOverrideFingerprint) {
       const hash = createHash('sha256');
-      for await (const chunk of createReadStream(overridePath)) hash.update(chunk);
+      const stat = await fs.stat(overridePath);
+      let readBytes = 0;
+      reportProgress({ phase: 'hashing retained source PBF', completed: 0, total: stat.size, unit: 'bytes', detail: path.basename(overridePath) });
+      for await (const chunk of createReadStream(overridePath)) {
+        hash.update(chunk);
+        readBytes += chunk.length;
+        reportProgress({ phase: 'hashing retained source PBF', completed: readBytes, total: stat.size, unit: 'bytes', detail: path.basename(overridePath) });
+      }
       actualOverrideFingerprint = hash.digest('hex');
     }
   }
-  const inputs = diffFiles ?? [diffFile];
-  if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('at least one replication diff file is required');
-
   const affectedCells = new Set();
   const mutateGeneration = async (generation, activeRoot) => {
     const activeState = JSON.parse(await fs.readFile(path.join(activeRoot, 'state.json'), 'utf8'));
@@ -347,7 +395,13 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
       await fs.rm(cacheDir, { recursive: true, force: true });
       cachedIndex = null;
     }
-    if (!cachedIndex) await buildSourceBlockIndex(sourcePbf, cacheDir, { sourceFingerprint: activeState.sourceFingerprint ?? undefined });
+    if (!cachedIndex) {
+      reportProgress({ phase: 'building baseline PBF block index', completed: 0, total: null, unit: 'blocks', detail: path.basename(sourcePbf) });
+      await buildSourceBlockIndex(sourcePbf, cacheDir, {
+        sourceFingerprint: activeState.sourceFingerprint ?? undefined,
+        onProgress: reportProgress
+      });
+    } else reportProgress({ phase: 'checking cached baseline PBF block index', completed: 1, total: 1, unit: 'indexes' });
     const source = await openSourceBlockIndex(cacheDir, { sourcePbf, expectedFingerprint: activeState.sourceFingerprint ?? actualOverrideFingerprint });
     if (activeState.sourceFingerprint && source.metadata.sourceFingerprint !== activeState.sourceFingerprint) {
       await source.close();
@@ -357,16 +411,19 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
     let indexes = null;
     const indexDir = path.join(generation, 'update-indexes');
     try {
-      if (!(await fs.stat(path.join(indexDir, 'tracked-index.json')).catch(() => null))) await buildTrackedIndexes(generation, indexDir);
+      if (!(await fs.stat(path.join(indexDir, 'tracked-index.json')).catch(() => null))) {
+        await buildTrackedIndexes(generation, indexDir, null, reportProgress);
+      } else reportProgress({ phase: 'checking cached tracked-object indexes', completed: 1, total: 1, unit: 'indexes' });
       const tracked = JSON.parse(await fs.readFile(path.join(indexDir, 'tracked-index.json'), 'utf8'));
       indexes = { dir: indexDir, partitions: tracked.partitions,
         objectCells: openPartitionedMultiIndex(path.join(indexDir, 'object-cells'), tracked.partitions),
         reverseParents: openPartitionedMultiIndex(path.join(indexDir, 'reverse-parents'), tracked.partitions) };
       const batch = []; let batchBytes = 0; let changedCount = 0; let maxObjectTimestamp = 0;
       const changedIds = new Map();
+      let parsedObjects = 0;
       const flush = async () => {
         if (!batch.length) return;
-        const before = await resolveMany(store, source, batch.map((o) => ({ type: o.type, id: o.id })));
+        const before = await resolveMany(store, source, batch.map((o) => ({ type: o.type, id: o.id })), reportProgress, 'resolving replication objects against baseline PBF');
         const newer = batch.filter((change) => (before.get(ID(change.type, change.id))?.version ?? 0) < change.version);
         const results = await store.applyBatch(newer);
         const applied = new Set(results.filter((item) => item.applied).map((item) => `${item.key}@${item.version}`));
@@ -381,6 +438,7 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
         if (changedIds.size > MAX_AFFECTED) throw new Error(`diff changes exceed ${MAX_AFFECTED} tracked objects; use a smaller replication interval`);
         batch.length = 0; batchBytes = 0;
       };
+      reportProgress({ phase: 'parsing downloaded replication diffs', completed: 0, total: inputs.length, unit: 'diffs' });
       for (const input of inputs) {
         checkAborted(signal);
         for await (const change of parseOsmChange(openDiffXml(input, { signal }))) {
@@ -390,14 +448,21 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
           if (size > maxBatchBytes) throw new Error(`change ${change.type}:${change.id} exceeds update batch byte limit`);
           if (batch.length >= maxBatchObjects || batchBytes + size > maxBatchBytes) await flush();
           batch.push(change); batchBytes += size;
+          parsedObjects += 1;
+          if (parsedObjects % 10000 === 0) {
+            reportProgress({ phase: 'parsing downloaded replication diffs', completed: completedDiffs, total: inputs.length, unit: 'diffs', detail: `${parsedObjects.toLocaleString('en-US')} OSM changes parsed; current ${path.basename(input)}` });
+          }
         }
         checkAborted(signal); await flush();
+        completedDiffs += 1;
+        reportProgress({ phase: 'parsing downloaded replication diffs', completed: completedDiffs, total: inputs.length, unit: 'diffs', detail: `${parsedObjects.toLocaleString('en-US')} OSM changes parsed` });
       }
       checkAborted(signal);
       if (changedIds.size) {
-        const rebuilt = await applyAcceptedChanges(generation, [...changedIds.values()], store, source, indexes, amenities, shardPrecision, sequence, signal);
+        const rebuilt = await applyAcceptedChanges(generation, [...changedIds.values()], store, source, indexes, amenities, shardPrecision, sequence, signal, reportProgress);
         for (const cell of rebuilt.cells) affectedCells.add(cell);
       }
+      reportProgress({ phase: 'preparing updated manifest', completed: 0, total: null, unit: 'steps', detail: `${affectedCells.size.toLocaleString('en-US')} affected shards` });
       const manifest = JSON.parse(await fs.readFile(path.join(generation, 'manifest.json'), 'utf8'));
       const shardNames = new Set(manifest.shards.map((cell) => cell.replace(/\.bin$/, '')));
       for (const cell of affectedCells) {
@@ -405,7 +470,7 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
         if (await fs.stat(file).catch(() => null)) shardNames.add(cell); else shardNames.delete(cell);
       }
       manifest.shards = [...shardNames].sort(); manifest.shardCount = manifest.shards.length;
-      await recountManifest(generation, manifest, amenities);
+      await recountManifest(generation, manifest, amenities, reportProgress);
       manifest.buildSequence = sequence;
       const namespaceSequence = { ...replication, sequenceNumber: sequence };
       const planetMinute = replication.kind === 'planet' && replication.interval === 'minute';
@@ -422,9 +487,13 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
       checkAborted(signal);
       const manifest = JSON.parse(await fs.readFile(path.join(generation, 'manifest.json'), 'utf8'));
       const state = JSON.parse(await fs.readFile(path.join(generation, 'state.json'), 'utf8'));
+      let completed = 0;
+      reportProgress({ phase: 'validating output shards', completed, total: manifest.shards.length, unit: 'shards' });
       for (const cellValue of manifest.shards) {
         const cell = cellValue.replace(/\.bin$/, ''); const buffer = await fs.readFile(path.join(generation, 'shards', `${cell}.bin`));
         const shard = readShard(buffer); if (shard.header.configHash !== manifest.configHash) throw new Error(`shard ${cell} config hash mismatch during update validation`);
+        completed += 1;
+        reportProgress({ phase: 'validating output shards', completed, total: manifest.shards.length, unit: 'shards' });
       }
       if (state.replication?.sequenceNumber !== sequence || (state.replication.kind === 'planet' && state.replication.interval === 'minute' && state.lastSeq !== sequence)) throw new Error('generation cursor did not reach the target namespace sequence');
   };
@@ -435,7 +504,8 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
   } else ({ result } = await withGenerationTransaction(pipelineDir, mutateGeneration, {
     validate: validateGeneration,
     beforeActivate: beforePublish,
-    afterActivate: async (_generation, value) => { if (engine && value?.cells?.length) engine.invalidateCells(value.cells); }
+    afterActivate: async (_generation, value) => { if (engine && value?.cells?.length) engine.invalidateCells(value.cells); },
+    onProgress: reportProgress
   }));
   return result;
 }

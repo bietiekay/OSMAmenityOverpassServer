@@ -10,7 +10,8 @@ async function syncDirectory(directory) {
 }
 
 /** Force every file and directory in a private generation before publishing it. */
-export async function syncGenerationTree(root) {
+export async function syncGenerationTree(root, onProgress = () => {}) {
+  const progress = { files: 0 };
   const syncTree = async (directory) => {
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
       const target = path.join(directory, entry.name);
@@ -18,6 +19,8 @@ export async function syncGenerationTree(root) {
       else if (entry.isFile()) {
         const file = await fs.open(target, 'r');
         try { await file.sync(); } finally { await file.close(); }
+        progress.files += 1;
+        onProgress({ phase: 'syncing update candidate to disk', completed: progress.files, total: null, unit: 'files' });
       } else throw new Error(`generation contains unsupported filesystem entry: ${target}`);
     }
     await syncDirectory(directory);
@@ -25,17 +28,19 @@ export async function syncGenerationTree(root) {
   await syncTree(root);
 }
 
-async function cloneTree(source, destination) {
+async function cloneTree(source, destination, onProgress = () => {}, progress = { files: 0 }) {
   await fs.mkdir(destination, { recursive: true });
   for (const entry of await fs.readdir(source, { withFileTypes: true })) {
     const from = path.join(source, entry.name); const to = path.join(destination, entry.name);
-    if (entry.isDirectory()) await cloneTree(from, to);
+    if (entry.isDirectory()) await cloneTree(from, to, onProgress, progress);
     else if (entry.isFile()) {
       try { await fs.link(from, to); }
       catch (error) {
         if (!['EXDEV', 'EPERM', 'EACCES', 'EMLINK'].includes(error.code)) throw error;
         await fs.copyFile(from, to);
       }
+      progress.files += 1;
+      onProgress({ phase: 'copying active generation into update candidate', completed: progress.files, total: null, unit: 'files' });
     } else throw new Error(`generation contains unsupported filesystem entry: ${from}`);
   }
 }
@@ -111,7 +116,7 @@ export async function activateGeneration(dataDir, generationDir, { lockHeld = fa
   return lockHeld ? activate() : withGenerationLock(dataDir, activate);
 }
 
-async function runTransaction(dataDir, mutate, { validate = async () => {}, beforeActivate = null, afterActivate = null } = {}) {
+async function runTransaction(dataDir, mutate, { validate = async () => {}, beforeActivate = null, afterActivate = null, onProgress = () => {} } = {}) {
   const activeLink = path.join(dataDir, 'data');
   const activeRoot = await fs.realpath(activeLink);
   const generations = path.join(dataDir, 'data-generations');
@@ -121,11 +126,12 @@ async function runTransaction(dataDir, mutate, { validate = async () => {}, befo
   let activated = false;
   await fs.mkdir(generations, { recursive: true });
   try {
-    await cloneTree(activeRoot, staging);
+    await cloneTree(activeRoot, staging, onProgress);
     const result = await mutate(staging, activeRoot);
+    onProgress({ phase: 'validating update candidate', completed: 0, total: null, unit: 'steps' });
     await validate(staging, result);
     if (beforeActivate) await beforeActivate(staging, result);
-    await syncGenerationTree(staging);
+    await syncGenerationTree(staging, onProgress);
     await fs.rename(staging, published);
     await syncDirectory(generations);
     const nextLink = path.join(dataDir, `.data-${txid}`);
