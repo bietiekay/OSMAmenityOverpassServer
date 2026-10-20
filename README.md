@@ -190,6 +190,13 @@ increase concurrent `osmium cat` processes, temporary PBF files, RAM use, and
 disk I/O; compare full catch-up rates when tuning it.
 The grouped import reads the reduced spool directly; it does not write another
 copy of all changed objects.
+After a successful catch-up or an up-to-date check, the updater removes leftover
+downloaded update/re-extract diffs through the published sequence and abandoned
+coalescing, re-extract work, staging-generation, and PBF-lookup directories
+from earlier runs. It leaves
+the active and older published generations, retained source PBF, and reusable
+source indexes in place. A cleanup failure is logged without undoing an
+already published update.
 
 The line pipeline is partitioned and bounded in its lookups, but Japan success
 does not demonstrate planet-size runtime or resource bounds. Relations currently

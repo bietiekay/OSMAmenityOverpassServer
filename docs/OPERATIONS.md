@@ -374,6 +374,13 @@ indexes for every untracked object. All changed objects remain in the delta
 overlay so later references and update cycles can resolve their latest versions.
 The affected-change scan and grouped-write phases report continuous object
 counts and ETAs. The grouped import does not create another full-size spool.
+After a successful update or an up-to-date feed check, cleanup removes leftover
+update/re-extract diff files through the published cursor and abandoned
+coalescing, re-extract work, staging, and PBF-lookup directories from before
+that run. Cleanup takes the generation
+lock and only removes known temporary name patterns. Active and older published
+generations, retained PBFs, and reusable source indexes remain. Cleanup errors
+are logged; a published cursor is not rolled back for a cleanup failure.
 After a batch publishes, `update catch-up assessment:` reports its end-to-end
 rate, how far the feed advanced during the run, and whether the remaining
 backlog shrank or grew. For a planet/minute feed, the backlog must shrink over

@@ -9,6 +9,7 @@ import { fetchReplicationState, downloadDiff } from './update/replication.mjs';
 import { applyDiffGeneration } from './update/apply-generation.mjs';
 import { maybeRunReextract } from './update/reextract.mjs';
 import { createProgressLogger, formatDuration } from './update/progress.mjs';
+import { cleanupOrphanedUpdateData } from './update/cleanup.mjs';
 
 const MAX_DIFFS = 100000;
 const MAX_DIFF_BYTES = 2 * 1024 * 1024 * 1024;
@@ -101,8 +102,18 @@ export function createUpdateWorker({
 }) {
   const root = pipelineRoot(pipelineDir);
 
+  const cleanupAfterSuccess = async (olderThanMs, publishedSequence) => {
+    try {
+      const removed = await cleanupOrphanedUpdateData(root, { olderThanMs, publishedSequence });
+      if (Object.values(removed).some(Boolean)) onLog(`update cleanup: removed ${removed.diffs} leftover diffs, ${removed.coalesceDirs} coalescing directories, ${removed.reextractDirs} re-extract directories, ${removed.stagingDirs} staging generations, ${removed.lookupDirs} lookup directories, ${removed.attestations} attestation files, ${removed.linkTemps} temporary links`);
+    } catch (error) {
+      onLog(`update cleanup skipped: ${error.message}`);
+    }
+  };
+
   async function runOnce(signal = undefined) {
     if (signal?.aborted) throw abortError(signal);
+    const runStartedAt = Date.now();
     const progress = createProgressLogger(onLog);
     try {
     const { state } = await readState(root);
@@ -114,13 +125,18 @@ export function createUpdateWorker({
     if (latest.sequenceNumber < cursor) throw new Error(`replication source regressed from local sequence ${cursor} to ${latest.sequenceNumber}`);
     const gap = latest.sequenceNumber - cursor;
     if (gap > maxDiffs) throw new Error(`catch-up gap of ${gap} sequences exceeds the ${maxDiffs}-diff update limit; rebuild from a newer baseline`);
-    if (gap === 0) { onLog(`up to date at ${cursor}`); return { fromSequence: cursor, toSequence: cursor, changedCount: 0, cells: [] }; }
+    if (gap === 0) {
+      onLog(`up to date at ${cursor}`);
+      await cleanupAfterSuccess(runStartedAt, cursor);
+      return { fromSequence: cursor, toSequence: cursor, changedCount: 0, cells: [] };
+    }
     const catchUpStartedAt = Date.now();
     onLog(`update catch-up: local sequence ${cursor}, feed sequence ${latest.sequenceNumber}, backlog ${gap} ${replication.interval} diffs`);
     progress.setBatchProgress(0, gap);
     const verifiedSource = await resolveStateSource(root, sourcePbf, state, (event) => progress.report(event.phase, event.completed, event.total, event.unit, event.detail));
     const diffFiles = [];
     let compressedBytes = 0;
+    let publishedSequence = null;
     try {
       progress.report('downloading replication diffs', 0, gap, 'diffs', `next sequence ${cursor + 1}`);
       for (let sequence = cursor + 1; sequence <= latest.sequenceNumber; sequence += 1) {
@@ -151,6 +167,7 @@ export function createUpdateWorker({
           progress.report(event.phase, event.completed, event.total, event.unit, event.detail, event.showEta !== false);
         }
       });
+      publishedSequence = latest.sequenceNumber;
       onLog(`applied ${replication.kind}/${replication.interval} sequences ${cursor + 1}-${latest.sequenceNumber}: ${result.changedCount} changed objects, ${result.cells.length} cells`);
       let remainingGap = null;
       try {
@@ -165,7 +182,12 @@ export function createUpdateWorker({
         onLog(`update catch-up assessment unavailable after publication: ${error.message}`);
       }
       return { ...result, fromSequence: cursor + 1, toSequence: latest.sequenceNumber, remainingGap };
-    } finally { await Promise.all(diffFiles.map((diff) => fs.rm(diff, { force: true }))); }
+    } finally {
+      const removals = await Promise.allSettled(diffFiles.map((diff) => fs.rm(diff, { force: true })));
+      const failures = removals.filter((item) => item.status === 'rejected');
+      if (failures.length) onLog(`update cleanup: could not remove ${failures.length} downloaded diffs`);
+      if (publishedSequence !== null) await cleanupAfterSuccess(runStartedAt, publishedSequence);
+    }
     } finally { progress.close(); }
   }
 
