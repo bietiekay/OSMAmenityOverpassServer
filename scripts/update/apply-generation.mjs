@@ -31,16 +31,20 @@ const lookupNeedsSmallerBatch = (error) =>
   /(?:source candidate blocks require|source lookup result exceeds).*request a smaller lookup batch/.test(error.message);
 
 /** Keep baseline PBF lookups within both the candidate-block and output limits. */
-async function resolveBaselineBatch(source, requests) {
+async function resolveBaselineBatch(source, requests, onStep = () => {}) {
+  onStep('start', requests.length);
   try {
-    return (await source.resolveObjects(requests, {
+    const objects = (await source.resolveObjects(requests, {
       maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024
     })).objects;
+    onStep('complete', requests.length, objects.length);
+    return objects;
   } catch (error) {
     if (!lookupNeedsSmallerBatch(error) || requests.length <= 1) throw error;
+    onStep('split', requests.length);
     const middle = Math.floor(requests.length / 2);
-    const first = await resolveBaselineBatch(source, requests.slice(0, middle));
-    const second = await resolveBaselineBatch(source, requests.slice(middle));
+    const first = await resolveBaselineBatch(source, requests.slice(0, middle), onStep);
+    const second = await resolveBaselineBatch(source, requests.slice(middle), onStep);
     return [...first, ...second];
   }
 }
@@ -478,14 +482,43 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
         if (item.version > ((await store.get(item.type, item.id))?.version ?? 0)) relevant.push(item);
       }
       const baselineVersions = new Map();
-      reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: 0, total: relevant.length, unit: 'objects' });
+      const baselinePhase = 'checking relevant changes against baseline PBF';
+      const activeLookups = new Map();
+      let baselineCompleted = 0;
+      let baselineFound = 0;
+      let baselineSplits = 0;
+      const reportBaselineProgress = () => {
+        const active = [...activeLookups.values()];
+        const detail = `${baselineFound.toLocaleString('en-US')} baseline objects found; ${active.length} active PBF lookups${active.length ? ` (batch sizes: ${active.join(', ')})` : ''}; ${baselineSplits} batches split`;
+        reportProgress({ phase: baselinePhase, completed: baselineCompleted, total: relevant.length, unit: 'objects', detail,
+          showEta: baselineCompleted >= Math.min(REF_BATCH * workers, relevant.length) });
+      };
+      reportBaselineProgress();
       for (let i = 0; i < relevant.length; i += REF_BATCH * workers) {
         checkAborted(signal);
         const parts = [];
         for (let j = i; j < Math.min(i + REF_BATCH * workers, relevant.length); j += REF_BATCH) parts.push(relevant.slice(j, j + REF_BATCH));
-        const baselines = await settledWave(parts.map((part) => resolveBaselineBatch(source, part.map(({ type, id }) => ({ type, id })))));
+        const baselines = await settledWave(parts.map(async (part, worker) => {
+          try {
+            return await resolveBaselineBatch(source, part.map(({ type, id }) => ({ type, id })), (step, count, found = 0) => {
+              if (step === 'start') activeLookups.set(worker, count);
+              else if (step === 'complete') {
+                activeLookups.delete(worker);
+                baselineCompleted += count;
+                baselineFound += found;
+              } else if (step === 'split') {
+                activeLookups.delete(worker);
+                baselineSplits += 1;
+              }
+              reportBaselineProgress();
+            });
+          } finally {
+            activeLookups.delete(worker);
+            reportBaselineProgress();
+          }
+        }));
         for (const baseline of baselines) for (const object of baseline) baselineVersions.set(ID(object.type, object.id), object.version);
-        reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: Math.min(i + REF_BATCH * workers, relevant.length), total: relevant.length, unit: 'objects', detail: `${baselineVersions.size.toLocaleString('en-US')} baseline objects resolved with ${workers} workers` });
+        reportBaselineProgress();
       }
       for (const item of relevant) {
         if (item.version <= (baselineVersions.get(ID(item.type, item.id)) ?? 0)) continue;
