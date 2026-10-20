@@ -1,37 +1,18 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { finished } from 'node:stream/promises';
 import readline from 'node:readline';
 import { parseOsmChange } from './change-parser.mjs';
 import { openDiffXml } from './replication.mjs';
+import { sortWithProgress } from './progress-sort.mjs';
 
 const MAX_SPOOL_BYTES = 128 * 1024 * 1024 * 1024;
 
 async function writeLine(stream, line) {
   if (!stream.write(line)) await once(stream, 'drain');
-}
-
-async function sortChanges(input, output, tempDir, signal) {
-  await new Promise((resolve, reject) => {
-    const child = spawn('sort', ['-S', '32M', '-T', tempDir, '-t', '\t', '-k1,1', '-k2,2', '-k3,3', input, '-o', output], {
-      env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'ignore', 'pipe']
-    });
-    let stderr = '';
-    child.stderr.on('data', (chunk) => { if (stderr.length < 8192) stderr += chunk.toString().slice(0, 8192 - stderr.length); });
-    const abort = () => child.kill('SIGTERM');
-    signal?.addEventListener('abort', abort, { once: true });
-    child.once('error', reject);
-    child.once('close', (code, childSignal) => {
-      signal?.removeEventListener('abort', abort);
-      if (code === 0) resolve();
-      else reject(signal?.aborted ? signal.reason ?? new Error('update coalescing aborted') : new Error(`sort coalesced diffs failed (${code ?? childSignal}): ${stderr}`));
-    });
-    if (signal?.aborted) abort();
-  });
 }
 
 /** Keep only the last sequence-ordered change for each typed OSM ID using an external bounded-memory sort. */
@@ -72,8 +53,11 @@ export async function coalesceDiffFiles(diffFiles, workDir, { signal, onProgress
     await finished(rawStream);
     rawStream = null;
 
-    onProgress({ phase: 'sorting coalesced changes', completed: 0, total: null, unit: 'changes', batchCompletedDiffs: diffFiles.length, detail: `${eventCount.toLocaleString('en-US')} changes; ${Math.round(spoolBytes / (1024 * 1024))} MiB spool` });
-    await sortChanges(raw, sorted, tempDir, signal);
+    await sortWithProgress(raw, sorted, ['-S', '32M', '-T', tempDir, '-t', '\t', '-k1,1', '-k2,2', '-k3,3'], {
+      signal,
+      detail: `${eventCount.toLocaleString('en-US')} changes; ${Math.round(spoolBytes / (1024 * 1024))} MiB spool`,
+      onProgress: (event) => onProgress({ phase: 'sorting coalesced changes', batchCompletedDiffs: diffFiles.length, ...event })
+    });
     await fs.rm(raw, { force: true });
 
     const sortedLines = readline.createInterface({ input: createReadStream(sorted), crlfDelay: Infinity });

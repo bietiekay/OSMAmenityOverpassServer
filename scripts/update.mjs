@@ -148,7 +148,7 @@ export function createUpdateWorker({
           if (Number.isSafeInteger(event.batchCompletedDiffs) && Number.isSafeInteger(event.batchTotalDiffs)) {
             progress.setBatchProgress(event.batchCompletedDiffs, event.batchTotalDiffs);
           }
-          progress.report(event.phase, event.completed, event.total, event.unit, event.detail);
+          progress.report(event.phase, event.completed, event.total, event.unit, event.detail, event.showEta !== false);
         }
       });
       onLog(`applied ${replication.kind}/${replication.interval} sequences ${cursor + 1}-${latest.sequenceNumber}: ${result.changedCount} changed objects, ${result.cells.length} cells`);

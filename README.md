@@ -161,11 +161,14 @@ state in the batch. Diff files are still read in sequence order, and the latest
 event wins, including a final deletion. This avoids repeatedly resolving and
 rebuilding intermediate versions when an object changed many times while the
 server was behind. It does not skip replication sequences or remove the need to
-read and validate every diff. Coalescing uses an external disk sort with a
-32 MiB sort-memory setting and allows up to 128 GiB of temporary TSV spool data
-under the update-diffs work directory; ensure free disk space for the spool and
-sort output. This reduces duplicate work but is not a guarantee that a
-planet-scale update will catch up.
+read and validate every diff. OsmChange `modify` entries replace the complete
+object, including its full tag set and way/relation references; they are not
+field-level patches. Coalescing therefore preserves the current state but does
+not retain intermediate object versions or their history. It uses an external
+disk sort with a 32 MiB sort-memory setting and allows up to 128 GiB of
+temporary TSV spool data under the update-diffs work directory; ensure free
+disk space for the spool and sort output. This reduces duplicate work but does
+not guarantee that a planet-scale update will catch up.
 
 After coalescing, the updater runs independent baseline lookups and amenity
 geometry tasks concurrently, up to `OSM_AMENITY_UPDATE_WORKERS`. Each task
@@ -208,8 +211,14 @@ require operator-managed retention and disk capacity.
 While a catch-up is running, the updater emits a progress heartbeat about every
 30 seconds. Logs identify the current phase (source-PBF hashing/indexing, diff
 download and parsing, baseline object resolution, shard rebuild, recount,
-validation, or disk sync), with a phase rate and ETA when a total is known. For a
-planet/minute feed, the backlog can only shrink if the sustained end-to-end
+validation, or disk sync), with a phase rate and ETA when a total is known.
+
+The two external sort phases show a byte-based percentage: the first half tracks
+input read by `sort`, the second half tracks sorted output written. Progress can
+pause near 50% while GNU `sort` merges temporary runs internally, so these
+phases deliberately show no ETA.
+
+For a planet/minute feed, the backlog can only shrink if the sustained end-to-end
 processing rate exceeds one replication diff per minute; compare the reported
 diff-processing rate across several log entries. Phase ETAs are estimates for
 that phase, not a promise for the complete update. The active replication cursor

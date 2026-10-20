@@ -38,7 +38,7 @@ export function createProgressLogger(onLog = console.log, intervalMs = 30_000) {
       ? `${formatAmount(current.completed, current.unit)} ${current.unit}`
       : `${formatAmount(current.completed, current.unit)}/${formatAmount(current.total, current.unit)} ${current.unit}`;
     const percent = current.total > 0 ? ` (${Math.min(100, current.completed / current.total * 100).toFixed(1)}%)` : '';
-    const eta = current.total !== null && ratePerSecond > 0
+    const eta = current.showEta && current.total !== null && ratePerSecond > 0
       ? ` | ETA ${formatDuration((current.total - current.completed) / ratePerSecond)}`
       : '';
     const detail = current.detail ? ` | ${current.detail}` : '';
@@ -62,10 +62,10 @@ export function createProgressLogger(onLog = console.log, intervalMs = 30_000) {
       if (!batch || batch.total !== total) batch = { completed, total, startedAt: Date.now() };
       else batch.completed = completed;
     },
-    report(phase, completed = 0, total = null, unit = 'items', detail = '') {
+    report(phase, completed = 0, total = null, unit = 'items', detail = '', showEta = true) {
       const now = Date.now();
       if (!current || current.phase !== phase || completed < current.completed) {
-        current = { phase, completed, total, unit, detail, startedAt: now, startCompleted: completed, lastEmitAt: 0 };
+        current = { phase, completed, total, unit, detail, showEta, startedAt: now, startCompleted: completed, lastEmitAt: 0 };
         emit();
         if (!timer) {
           timer = setInterval(emit, intervalMs);
@@ -77,6 +77,7 @@ export function createProgressLogger(onLog = console.log, intervalMs = 30_000) {
       current.total = total;
       current.unit = unit;
       current.detail = detail;
+      current.showEta = showEta;
       if ((total !== null && completed >= total) || now - current.lastEmitAt >= intervalMs) emit();
     },
     close() {

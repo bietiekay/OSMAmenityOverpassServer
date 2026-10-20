@@ -331,14 +331,24 @@ Monitor these together:
 
 During a catch-up, look for `update progress:` heartbeat entries about every 30
 seconds. They report the current phase, phase throughput, and ETA when the phase
-has a known total. The updater processes contiguous diffs as one atomic batch,
-so `/api/status` keeps the old cursor until validation and publication finish.
+has a known total.
+
+The coalesced-change and delta-partition sort phases report a byte-based
+percentage: 0–50% for reading input and 50–100% for writing sorted output.
+GNU `sort` may spend time merging temporary runs around 50% with no visible
+percentage change. No ETA is shown for these two phases.
+
+The updater processes contiguous diffs as one atomic batch, so `/api/status`
+keeps the old cursor until validation and publication finish.
 Before applying a batch, it now reads every diff in sequence order and coalesces
 repeated changes for each typed OSM ID to the final event in that batch. A
 sequence ending in a deletion remains a deletion. This avoids doing baseline
 lookups and geometry work repeatedly for intermediate versions; it does not
-skip any replication diff or sequence. The coalescing stage writes a TSV spool
-and externally sorts it with GNU `sort` (configured for 32 MiB sort memory),
+skip any replication diff or sequence. Each OsmChange `modify` contains a full
+replacement object, so tags and member references are taken from the final
+version rather than merged field by field. Intermediate versions are omitted
+from the current-state index. The coalescing stage writes a TSV spool and
+externally sorts it with GNU `sort` (configured for 32 MiB sort memory),
 then streams the final per-object events into the update. Temporary spool data
 is capped at 128 GiB in `work/update-diffs`; the sort also needs room for its
 sorted output and temporary files, so check free space before a large catch-up.

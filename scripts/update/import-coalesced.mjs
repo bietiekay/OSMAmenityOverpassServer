@@ -1,11 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { finished } from 'node:stream/promises';
 import readline from 'node:readline';
 import { deltaPartitionForKey } from './delta-store.mjs';
+import { sortWithProgress } from './progress-sort.mjs';
 
 const FILTER_BYTES = 64 * 1024 * 1024;
 const MAX_SPOOL_BYTES = 128 * 1024 * 1024 * 1024;
@@ -45,25 +45,6 @@ async function buildTrackedFilter(indexes, signal, onProgress) {
     onProgress({ phase: 'filtering tracked update keys', completed: i + 1, total: files.length, unit: 'index files' });
   }
   return filter;
-}
-
-async function sortByPartition(input, output, tempDir, workers, signal) {
-  await new Promise((resolve, reject) => {
-    const child = spawn('sort', ['-S', '64M', `--parallel=${workers}`, '-T', tempDir, '-t', '\t', '-k1,1', input, '-o', output], {
-      env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'ignore', 'pipe']
-    });
-    let stderr = '';
-    child.stderr.on('data', (chunk) => { if (stderr.length < 8192) stderr += chunk.toString().slice(0, 8192 - stderr.length); });
-    const abort = () => child.kill('SIGTERM');
-    signal?.addEventListener('abort', abort, { once: true });
-    child.once('error', reject);
-    child.once('close', (code, childSignal) => {
-      signal?.removeEventListener('abort', abort);
-      if (code === 0) resolve();
-      else reject(signal?.aborted ? signal.reason ?? new Error('update import aborted') : new Error(`sorting delta partitions failed (${code ?? childSignal}): ${stderr}`));
-    });
-    if (signal?.aborted) abort();
-  });
 }
 
 /** Scan final object events once, grouping all overlay writes by their disk partition. */
@@ -109,10 +90,12 @@ export async function prepareCoalescedImport(coalesced, indexes, amenities, {
     onProgress({ phase: 'partitioning coalesced changes', completed, total: coalesced.uniqueCount, unit: 'objects', detail: `${relevant.length.toLocaleString('en-US')} possibly affected objects` });
     if (completed !== coalesced.uniqueCount) throw new Error(`coalesced file contains ${completed} objects, expected ${coalesced.uniqueCount}`);
     await fs.rm(coalesced.file, { force: true });
-    onProgress({ phase: 'sorting delta partitions', completed: 0, total: null, unit: 'sorts', detail: `${Math.round(spoolBytes / (1024 * 1024))} MiB grouped spool` });
-    await sortByPartition(raw, sorted, tempDir, workers, signal);
+    await sortWithProgress(raw, sorted, ['-S', '64M', `--parallel=${workers}`, '-T', tempDir, '-t', '\t', '-k1,1'], {
+      signal,
+      detail: `${Math.round(spoolBytes / (1024 * 1024))} MiB grouped spool`,
+      onProgress: (event) => onProgress({ phase: 'sorting delta partitions', ...event })
+    });
     await fs.rm(raw, { force: true });
-    onProgress({ phase: 'sorting delta partitions', completed: 1, total: 1, unit: 'sorts' });
     return { file: sorted, relevant };
   } catch (error) {
     writer.destroy();
