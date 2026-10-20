@@ -43,7 +43,9 @@ export function createProgressLogger(onLog = console.log, intervalMs = 30_000) {
       : '';
     const detail = current.detail ? ` | ${current.detail}` : '';
     let batchLabel = '';
-    if (batch) {
+    if (batch?.completed >= batch?.total) {
+      batchLabel = ` | replication diffs prepared ${formatAmount(batch.completed, 'diffs')}/${formatAmount(batch.total, 'diffs')}`;
+    } else if (batch?.completed > 0) {
       const batchElapsed = Math.max(0.001, (now - batch.startedAt) / 1000);
       const batchRate = batch.completed / batchElapsed * 60;
       const batchEta = batchRate > 0 && batch.completed < batch.total

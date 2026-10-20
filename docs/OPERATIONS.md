@@ -356,6 +356,14 @@ simultaneous `osmium cat` processes, temporary candidate PBFs, RAM use, and
 disk traffic. Start with 2–3 only if resources permit, then measure completed
 batch throughput and backlog reduction. Changing `server.env` takes effect
 when the updater process is restarted.
+The large coalesced-object import groups changes by delta partition and writes
+each partition once, with distinct partitions processed concurrently. A bounded
+filter built from the tracked-object indexes avoids reading both indexes for
+every untracked object. All changed objects remain in the delta overlay so
+later references and update cycles can resolve their latest versions. The
+partitioning and grouped-write phases report continuous object counts and ETAs.
+The temporary grouped spool is limited to 128 GiB and needs additional space
+for its sorted output; check the pipeline filesystem before a large catch-up.
 After a batch publishes, `update catch-up assessment:` reports its end-to-end
 rate, how far the feed advanced during the run, and whether the remaining
 backlog shrank or grew. For a planet/minute feed, the backlog must shrink over
@@ -374,7 +382,8 @@ indexes. Unchanged file identities reuse attestations on later cycles.
 
 Update limits currently include 100,000 missing diffs, 2 GiB compressed catch-up
 data per batch, 512 MiB per downloaded/decompressed diff, 50,000 tracked affected
-objects, 5,000 affected cells, 64 MiB rebuilt rows, and a 64 MiB resolved-object
+objects, 128 MiB of possibly affected object records, 5,000 affected cells,
+64 MiB rebuilt rows, and a 64 MiB resolved-object
 limit per lookup invocation. The geometry rebuild's shared member-object cache
 has no aggregate byte cap; these limits are not a total update-process memory
 guarantee. A single source-block lookup must also fit its budget. Checked limits

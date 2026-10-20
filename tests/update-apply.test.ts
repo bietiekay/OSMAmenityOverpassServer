@@ -38,10 +38,10 @@ describe('incremental generation updates', () => {
       const diff = path.join(root, '006.osc.gz');
       await fs.writeFile(diff, gzipSync('<osmChange version="0.6"><create><node id="4" version="1" timestamp="2026-10-15T00:00:00Z" lat="34.99" lon="138.99"/></create><modify><node id="1" version="2" timestamp="2026-10-15T00:00:00Z" lat="35.1" lon="139.1"/></modify><modify><way id="10" version="2" timestamp="2026-10-15T00:00:00Z"><nd ref="1"/><nd ref="4"/></way></modify></osmChange>'));
       await fs.writeFile(pbf, wrongPbfBytes);
-      await expect(applyDiffGeneration(root, diff, { sequence: 6, dataTimestamp: '2026-10-15T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5, maxBatchObjects: 1 })).rejects.toThrow();
+      await expect(applyDiffGeneration(root, diff, { sequence: 6, dataTimestamp: '2026-10-15T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 })).rejects.toThrow();
       expect(await fs.stat(path.join(root, 'update-cache', `source-${sourceFingerprint}`, 'index.json')).catch(() => null)).toBeNull();
       await fs.writeFile(pbf, sourcePbfBytes);
-      const result = await applyDiffGeneration(root, diff, { sequence: 6, dataTimestamp: '2026-10-15T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5, maxBatchObjects: 1 });
+      const result = await applyDiffGeneration(root, diff, { sequence: 6, dataTimestamp: '2026-10-15T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 });
       expect(result.sequence).toBe(6);
       expect(await fs.realpath(path.join(root, 'data'))).not.toBe(oldGeneration);
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/state.json'), 'utf8'))).toMatchObject({ lastSeq: 0, replication: { sequenceNumber: 6 } });

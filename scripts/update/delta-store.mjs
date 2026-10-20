@@ -13,6 +13,7 @@ const valid = (type, id) => {
 };
 const hash = (key) => { let h = 2166136261; for (const c of key) h = Math.imul(h ^ c.charCodeAt(0), 16777619) >>> 0; return h >>> 0; };
 const partition = (key) => hash(key) % PARTITIONS;
+export const deltaPartitionForKey = partition;
 
 /** Append-only, hash-partitioned current-object overlay with bounded lookup cache. */
 export class DeltaObjectStore {
@@ -89,6 +90,45 @@ export class DeltaObjectStore {
       }
     }
     return results;
+  }
+
+  /** Replace one candidate-generation partition after an externally grouped import. */
+  async applyPartition(bucket, changes) {
+    if (!Number.isSafeInteger(bucket) || bucket < 0 || bucket >= PARTITIONS) throw new Error(`invalid delta partition ${bucket}`);
+    const values = await this.load(bucket);
+    let applied = 0;
+    for (const change of changes) {
+      valid(change.type, change.id);
+      if (!Number.isSafeInteger(change.version) || change.version < 1) throw new Error(`invalid version for ${change.type}:${change.id}`);
+      if (!['create', 'modify', 'delete'].includes(change.action)) throw new Error(`invalid action for ${change.type}:${change.id}`);
+      const key = identity(change.type, Number(change.id));
+      if (partition(key) !== bucket) throw new Error(`change ${key} is in the wrong delta partition`);
+      if ((values.get(key)?.version ?? 0) >= change.version) continue;
+      const record = change.action === 'delete'
+        ? { type: change.type, id: change.id, version: change.version, deleted: true }
+        : { ...change, action: undefined, deleted: false };
+      values.set(key, record);
+      applied += 1;
+    }
+    if (!applied) return 0;
+    const file = this.file(bucket);
+    const temp = `${file}.${randomUUID()}.bulk`;
+    let output = ''; let outputBytes = 0;
+    for (const value of values.values()) {
+      const line = `${JSON.stringify(value)}\n`;
+      outputBytes += Buffer.byteLength(line);
+      if (outputBytes > this.maxPartitionBytes) throw new Error(`compacted delta partition ${bucket} exceeds ${this.maxPartitionBytes} bytes`);
+      output += line;
+    }
+    await fs.mkdir(this.dir, { recursive: true });
+    try {
+      const handle = await fs.open(temp, 'wx');
+      try { await handle.writeFile(output); await handle.sync(); }
+      finally { await handle.close(); }
+      await fs.rename(temp, file);
+    } catch (error) { await fs.rm(temp, { force: true }); throw error; }
+    this.cache.clear(); this.cacheBytes = 0;
+    return applied;
   }
 
   async compactPartition(bucket) {

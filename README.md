@@ -172,9 +172,20 @@ geometry tasks concurrently, up to `OSM_AMENITY_UPDATE_WORKERS`. Each task
 resolves node, way, and relation dependencies against the same final object
 overlay. Completed geometry is merged in stable object-ID order, and a
 coordinator writes each affected shard once before validation and publication.
+For large batches, the updater also scans the coalesced objects sequentially,
+filters potentially affected keys using a bounded tracked-key filter, and groups
+all delta writes by disk partition. Each partition is written once, with
+different partitions processed concurrently up to the worker limit. The filter
+only skips index lookups for keys it can prove absent; it never suppresses a
+tracked change. The full delta overlay is still retained so later geometry
+references and future updates can resolve changed objects. Partitioning and
+grouped writes report object counts and phase ETAs.
 The setting is separate from initial extraction workers. More update workers
 increase concurrent `osmium cat` processes, temporary PBF files, RAM use, and
 disk I/O; compare full catch-up rates when tuning it.
+The grouped import writes another temporary spool of up to 128 GiB under the
+coalescing work directory, plus sort output while sorting. Leave space for
+these files in addition to the downloaded diffs and generation candidate.
 
 The line pipeline is partitioned and bounded in its lookups, but Japan success
 does not demonstrate planet-size runtime or resource bounds. Relations currently

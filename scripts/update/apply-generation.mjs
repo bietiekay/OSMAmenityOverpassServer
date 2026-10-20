@@ -4,8 +4,8 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { finished } from 'node:stream/promises';
-import readline from 'node:readline';
 import { coalesceDiffFiles } from './coalesce-diffs.mjs';
+import { prepareCoalescedImport, importCoalescedPartitions } from './import-coalesced.mjs';
 import { DeltaObjectStore } from './delta-store.mjs';
 import { resolveCurrentObjects } from './object-resolver.mjs';
 import { withGenerationTransaction, atomicWrite } from './generation.mjs';
@@ -372,7 +372,7 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
 /** Apply one fully downloaded namespace-local diff as an immutable generation. */
 export async function applyDiffGeneration(pipelineDir, diffFile, {
   sequence, replication, dataTimestamp = null, amenities = ['toilets'], shardPrecision = 5, engine = null,
-  maxBatchObjects = 2000, maxBatchBytes = 8 * 1024 * 1024, beforePublish = null,
+  maxBatchBytes = 8 * 1024 * 1024, beforePublish = null,
   sourcePbf: sourcePbfOverride = null, sourcePbfFingerprint = null, diffFiles = null,
   candidateGenerationDir = null, fromSequence = null, signal = null, onProgress = () => {}, updateWorkers = null
 }) {
@@ -449,57 +449,36 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
       indexes = { dir: indexDir, partitions: tracked.partitions,
         objectCells: openPartitionedMultiIndex(path.join(indexDir, 'object-cells'), tracked.partitions),
         reverseParents: openPartitionedMultiIndex(path.join(indexDir, 'reverse-parents'), tracked.partitions) };
-      const batch = []; let batchBytes = 0; let changedCount = 0;
+      let changedCount = 0;
       const changedIds = new Map();
-      let completedObjects = 0;
-      const flush = async () => {
-        if (!batch.length) return;
-        reportProgress({ phase: 'writing coalesced changes to delta store', completed: 0, total: batch.length, unit: 'objects', detail: `${completedObjects.toLocaleString('en-US')} of ${coalesced.uniqueCount.toLocaleString('en-US')} unique changes read` });
-        const results = await store.applyBatch(batch);
-        const applied = new Set(results.filter((item) => item.applied).map((item) => `${item.key}@${item.version}`));
-        const accepted = batch.filter((item) => applied.has(`${ID(item.type, item.id)}@${item.version}`));
-        const relevant = [];
-        for (const item of accepted) {
-          const key = ID(item.type, item.id);
-          const tracked = (await indexes.objectCells.get(key)).length > 0 || (await indexes.reverseParents.get(key)).length > 0;
-          const configuredMain = item.tags?.amenity && amenities.includes(item.tags.amenity);
-          if (tracked || configuredMain) relevant.push(item);
-        }
-        const baselineVersions = new Map();
-        for (let i = 0; i < relevant.length; i += REF_BATCH * workers) {
-          checkAborted(signal);
-          const parts = [];
-          for (let j = i; j < Math.min(i + REF_BATCH * workers, relevant.length); j += REF_BATCH) parts.push(relevant.slice(j, j + REF_BATCH));
-          const baselines = await settledWave(parts.map((part) => source.resolveObjects(part.map(({ type, id }) => ({ type, id })), {
-            maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024
-          })));
-          for (const baseline of baselines) for (const object of baseline.objects) baselineVersions.set(ID(object.type, object.id), object.version);
-          reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: Math.min(i + REF_BATCH * workers, relevant.length), total: relevant.length, unit: 'objects', detail: `${baselineVersions.size.toLocaleString('en-US')} baseline objects resolved with ${workers} workers` });
-        }
-        for (const item of relevant) {
-          if (item.version <= (baselineVersions.get(ID(item.type, item.id)) ?? 0)) continue;
-          changedCount += 1;
-          const key = ID(item.type, item.id);
-          changedIds.set(key, { type: item.type, id: item.id, version: item.version, action: item.action });
-        }
-        if (changedIds.size > MAX_AFFECTED) throw new Error(`diff changes exceed ${MAX_AFFECTED} tracked objects; use a smaller replication interval`);
-        batch.length = 0; batchBytes = 0;
-        reportProgress({ phase: 'applying coalesced changes', completed: completedObjects, total: coalesced.uniqueCount, unit: 'objects', detail: `${changedIds.size.toLocaleString('en-US')} tracked objects or configured amenities` });
-      };
-      let parsedObjects = 0;
-      reportProgress({ phase: 'applying coalesced changes', completed: 0, total: coalesced.uniqueCount, unit: 'objects', detail: `${coalesced.eventCount.toLocaleString('en-US')} events reduced to final object states` });
-      const changes = readline.createInterface({ input: createReadStream(coalesced.file), crlfDelay: Infinity });
-      for await (const line of changes) {
+      const prepared = await prepareCoalescedImport(coalesced, indexes, amenities, {
+        signal, onProgress: reportProgress, maxObjectBytes: maxBatchBytes, workers
+      });
+      const relevant = [];
+      for (const item of prepared.relevant) {
         checkAborted(signal);
-        const change = JSON.parse(line);
-        const size = Buffer.byteLength(line);
-        if (size > maxBatchBytes) throw new Error(`change ${change.type}:${change.id} exceeds update batch byte limit`);
-        if (batch.length >= maxBatchObjects || batchBytes + size > maxBatchBytes) await flush();
-        batch.push(change); batchBytes += size;
-        parsedObjects += 1;
-        completedObjects = parsedObjects;
+        if (item.version > ((await store.get(item.type, item.id))?.version ?? 0)) relevant.push(item);
       }
-      checkAborted(signal); await flush();
+      const baselineVersions = new Map();
+      reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: 0, total: relevant.length, unit: 'objects' });
+      for (let i = 0; i < relevant.length; i += REF_BATCH * workers) {
+        checkAborted(signal);
+        const parts = [];
+        for (let j = i; j < Math.min(i + REF_BATCH * workers, relevant.length); j += REF_BATCH) parts.push(relevant.slice(j, j + REF_BATCH));
+        const baselines = await settledWave(parts.map((part) => source.resolveObjects(part.map(({ type, id }) => ({ type, id })), {
+          maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024
+        })));
+        for (const baseline of baselines) for (const object of baseline.objects) baselineVersions.set(ID(object.type, object.id), object.version);
+        reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: Math.min(i + REF_BATCH * workers, relevant.length), total: relevant.length, unit: 'objects', detail: `${baselineVersions.size.toLocaleString('en-US')} baseline objects resolved with ${workers} workers` });
+      }
+      for (const item of relevant) {
+        if (item.version <= (baselineVersions.get(ID(item.type, item.id)) ?? 0)) continue;
+        changedCount += 1;
+        changedIds.set(ID(item.type, item.id), { type: item.type, id: item.id, version: item.version, action: item.action });
+      }
+      if (changedIds.size > MAX_AFFECTED) throw new Error(`diff changes exceed ${MAX_AFFECTED} tracked objects; use a smaller replication interval`);
+      await importCoalescedPartitions(store, prepared.file, coalesced.uniqueCount, { workers, signal, onProgress: reportProgress });
+      store.close();
       checkAborted(signal);
       if (changedIds.size) {
         const rebuilt = await applyAcceptedChanges(generation, [...changedIds.values()], store, source, indexes, amenities, shardPrecision, sequence, signal, workers, reportProgress);
