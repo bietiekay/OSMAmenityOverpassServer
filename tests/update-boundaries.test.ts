@@ -103,6 +103,26 @@ describe('generation and updater boundary guards', () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
+  it('coalesces repeated objects and merges concurrent geometry tasks once per shard', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'update-parallel-'));
+    try {
+      await createPipeline(root);
+      const first = await writeDiff(root, '<osmChange version="0.6"><modify><node id="1" version="3" timestamp="2026-10-15T00:00:00Z" lat="35.003" lon="139.003"><tag k="amenity" v="toilets"/></node></modify><create><node id="3" version="1" timestamp="2026-10-15T00:00:00Z" lat="35.004" lon="139.004"><tag k="amenity" v="toilets"/></node></create></osmChange>');
+      const second = await writeDiff(root, '<osmChange version="0.6"><modify><node id="1" version="4" timestamp="2026-10-16T00:00:00Z" lat="35.005" lon="139.005"><tag k="amenity" v="toilets"/></node><node id="3" version="2" timestamp="2026-10-16T00:00:00Z" lat="35.006" lon="139.006"><tag k="amenity" v="toilets"/></node></modify><create><node id="4" version="1" timestamp="2026-10-16T00:00:00Z" lat="35.007" lon="139.007"><tag k="amenity" v="toilets"/></node></create></osmChange>');
+      const result = await applyDiffBatchGeneration(root, [first, second], { fromSequence: 11, toSequence: 12, ...options(12), updateWorkers: 3 });
+      expect(result.changedCount).toBe(3);
+      const manifest = JSON.parse(await fs.readFile(path.join(root, 'data', 'manifest.json'), 'utf8'));
+      expect(manifest.totalElements).toBe(3);
+      const rows = [];
+      for (const cell of manifest.shards as string[]) rows.push(...readShard(await fs.readFile(path.join(root, 'data', 'shards', `${cell}.bin`))).elements);
+      const nodes = new Map(rows.filter((row) => row.type === 'node' && row.tags?.amenity === 'toilets').map((row) => [row.id, row]));
+      expect([...nodes.keys()].sort()).toEqual([1, 3, 4]);
+      expect(nodes.get(1)?.version).toBe(4);
+      expect(nodes.get(1)?.lat).toBe(35.005);
+      expect(nodes.get(3)?.version).toBe(2);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it('reports missing flock explicitly instead of bypassing the generation lock', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'update-no-flock-'));
     const previousPath = process.env.PATH;

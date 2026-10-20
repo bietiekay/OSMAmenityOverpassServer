@@ -28,7 +28,7 @@ function answers(w: Workspace, changes: Record<string, string> = {}) {
     project: 'test-planet', service: 'amenity-test', network: 'test-overpass', alias: 'test-amenity',
     hostIp: '', hostPort: '9091', proxyMode: '', proxyService: '', fallbacks: 'none',
     amenities: 'toilets,drinking_water', precision: '6', cache: '512', update: '300', rebuild: '', log: '',
-    chunk: '128', ram: '4096', worker: '1024', workers: '2', allValues: '', keepChunks: '', verify: '', write: ''
+    chunk: '128', ram: '6144', worker: '2048', workers: '2', updateWorkers: '3', allValues: '', keepChunks: '', verify: '', write: ''
   };
   return Object.entries(fields).map(([key, value]) => changes[key] ?? value).join('\n') + '\n';
 }
@@ -79,6 +79,7 @@ if [[ $1 == compose ]]; then
       elif [[ " $* " == *sourceMetadata* ]]; then
         if [[ \${MOCK_BAD_HEADER:-0} == 1 ]]; then echo 'invalid source provenance' >&2; exit 1; fi
         echo 'OSM_AMENITY_UPDATE_BASE_URL=https://planet.openstreetmap.org/replication/minute'
+        echo 'OSM_AMENITY_REPLICATION_SEQUENCE_NUMBER=7325026'
       else
         echo 'validated generation'
       fi
@@ -131,6 +132,7 @@ describe('interactive Docker setup', () => {
     expect(env).toContain('OSM_AMENITY_AMENITIES=toilets,drinking_water');
     expect(env).toContain('OSM_AMENITY_SHARD_PRECISION=6');
     expect(env).toContain('OSM_AMENITY_UPDATE_INTERVAL_SECONDS=300');
+    expect(env).toContain('OSM_AMENITY_UPDATE_WORKERS=3');
     const proxy = readFileSync(path.join(w.deployment, 'proxy.compose.example.yml'), 'utf8');
     expect(proxy).toContain('UPSTREAM_URLS: "http://test-amenity:8081/api/interpreter"');
     expect(proxy).not.toContain('overpass-api.de');
@@ -193,7 +195,7 @@ describe('interactive Docker setup', () => {
     expect(result.status, result.stderr).toBe(0);
     const log = readFileSync(docker.MOCK_LOG, 'utf8');
     expect(log).toContain('--amenities\ttoilets,drinking_water\t--shard-precision\t6');
-    expect(log).toContain('--ram-mb\t4096\t--worker-ram-mb\t1024\t--workers\t2');
+    expect(log).toContain('--ram-mb\t6144\t--worker-ram-mb\t2048\t--workers\t2');
     expect(log).toContain('--verify\ttrue');
     expect(log).toContain('scripts/verify-http.mjs');
     expect(readFileSync(path.join(w.deployment, 'server.env'), 'utf8')).toContain(

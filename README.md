@@ -55,6 +55,7 @@ requests instead of returning a misleading empty success.
 | `OSM_AMENITY_SHARD_PRECISION` | `5` | Geohash precision, 3 through 7 |
 | `OSM_AMENITY_SHARD_CACHE_MB` | `256` | In-memory shard LRU limit |
 | `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Update-loop wake cadence |
+| `OSM_AMENITY_UPDATE_WORKERS` | `1` | Concurrent update lookup and geometry tasks (1–16) |
 | `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Replication namespace root; Geofabrik host implies regional/day, otherwise planet/minute |
 | `OSM_AMENITY_SOURCE_PBF` | unset | Optional retained PBF path for updater re-extract; mounted path can differ from the source path recorded at build |
 | `OSM_AMENITY_REEXTRACT_SOURCE_PBF` | unset | Optional PBF used only for weekly drift re-extracts; falls back to `OSM_AMENITY_SOURCE_PBF` |
@@ -153,6 +154,27 @@ checks the weekly schedule after each catch-up cycle. These mechanisms still
 do not prove public Overpass parity, crash recovery in every failure mode, or
 planet-scale resource bounds. Regional Geofabrik inputs use their own daily
 namespace and sequence.
+
+Before applying a contiguous diff batch, the updater coalesces changes for the
+same typed OSM ID (node, way, or relation) and keeps only that object's final
+state in the batch. Diff files are still read in sequence order, and the latest
+event wins, including a final deletion. This avoids repeatedly resolving and
+rebuilding intermediate versions when an object changed many times while the
+server was behind. It does not skip replication sequences or remove the need to
+read and validate every diff. Coalescing uses an external disk sort with a
+32 MiB sort-memory setting and allows up to 128 GiB of temporary TSV spool data
+under the update-diffs work directory; ensure free disk space for the spool and
+sort output. This reduces duplicate work but is not a guarantee that a
+planet-scale update will catch up.
+
+After coalescing, the updater runs independent baseline lookups and amenity
+geometry tasks concurrently, up to `OSM_AMENITY_UPDATE_WORKERS`. Each task
+resolves node, way, and relation dependencies against the same final object
+overlay. Completed geometry is merged in stable object-ID order, and a
+coordinator writes each affected shard once before validation and publication.
+The setting is separate from initial extraction workers. More update workers
+increase concurrent `osmium cat` processes, temporary PBF files, RAM use, and
+disk I/O; compare full catch-up rates when tuning it.
 
 The line pipeline is partitioned and bounded in its lookups, but Japan success
 does not demonstrate planet-size runtime or resource bounds. Relations currently

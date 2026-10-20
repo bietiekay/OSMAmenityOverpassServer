@@ -101,7 +101,7 @@ repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 keys=(repository deployment pipeline sources source_file source_mode source_url checksum_url
   project service network dns_name host_ip host_port proxy_mode proxy_service proxy_url fallbacks
   amenities precision cache_mb update_seconds rebuild_seconds log_level chunk_mb ram_mb worker_mb
-  workers all_values keep_chunks verify)
+  workers update_workers all_values keep_chunks verify)
 validate_settings() {
   local key value other
   for key in repository deployment pipeline sources; do
@@ -120,9 +120,10 @@ validate_settings() {
   for value in "${urls[@]}"; do url_ok "$value" || fail 'Invalid fallback URL.'; done
   [[ $amenities =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] || fail 'Use comma-separated lowercase amenity values, without spaces.'
   ipv4_ok "$host_ip" || fail 'Invalid host IPv4 binding.'
-  for key in host_port precision cache_mb update_seconds rebuild_seconds chunk_mb ram_mb worker_mb workers; do
+  for key in host_port precision cache_mb update_seconds rebuild_seconds chunk_mb ram_mb worker_mb workers update_workers; do
     positive "${!key}" || fail "Invalid integer in $key."
   done
+  (( update_workers <= 16 )) || fail 'Update workers must be between 1 and 16.'
   (( host_port <= 65535 && precision >= 3 && precision <= 7 )) || fail 'Invalid port or shard precision.'
   (( worker_mb >= 2048 )) || fail 'Planet imports need at least 2048 MiB per worker; 1024 MiB is insufficient.'
   (( ram_mb >= worker_mb + 512 && workers * worker_mb + 512 <= ram_mb )) || fail 'RAM budget must cover all workers plus a 512 MiB controller reserve.'
@@ -153,6 +154,7 @@ if [[ $resume == true ]]; then
     printf -v "$key" '%s' "$value"
     loaded[$key]=1
   done < "$deployment/settings.tsv"
+  if [[ ! -v loaded[update_workers] ]]; then update_workers=1; loaded[update_workers]=1; fi
   for key in "${keys[@]}"; do [[ -v loaded[$key] ]] || fail "Missing saved setting: $key"; done
   [[ $deployment == "$requested_deployment" ]] || fail 'Saved deployment location differs from --resume.'
   validate_settings
@@ -249,6 +251,9 @@ else
   max_workers=$(((ram_mb - 512) / worker_mb))
   default_workers=3; (( max_workers >= 3 )) || default_workers=$max_workers
   ask_int workers 'Maximum extraction workers' "$default_workers" 1 "$max_workers"
+  printf 'Update workers run independent PBF lookups and geometry builds after each diff batch is coalesced.\n'
+  printf 'They are separate from extraction workers; more workers need additional RAM, CPU and disk throughput.\n'
+  ask_int update_workers 'Concurrent update workers (1-16; default 1)' 1 1 16
   printf 'This controls temporary import data, not which values the server answers today. Yes keeps objects tagged with any amenity value\n'
   printf 'so you can build another served amenity set later without repeating the PBF scan; it uses more disk. No keeps only\n'
   printf 'the values selected above and saves space, but adding values later requires rerunning the import from the PBF.\n'
@@ -266,6 +271,7 @@ else
   printf 'Project/service: %s / %s\nNetwork/alias:   %s / %s\nHost binding:    %s:%s\n' "$project" "$service" "$network" "$dns_name" "$host_ip" "$host_port"
   printf 'Proxy upstream: %s\nFallbacks: %s\nAmenities: %s; precision: %s\n' "$proxy_url" "${fallbacks:-none}" "$amenities" "$precision"
   printf 'Import: %s MiB RAM, %s workers x %s MiB; chunks %s MiB\n' "$ram_mb" "$workers" "$worker_mb" "$chunk_mb"
+  printf 'Update workers: %s\n' "$update_workers"
   printf 'Cache: %s MiB; update sleep: %s s; rebuild interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$rebuild_seconds" "$log_level"
   printf 'Retain all values: %s; keep chunks: %s; verify counts: %s\n' "$all_values" "$keep_chunks" "$verify"
   if [[ $host_ip != 127.0.0.1 ]]; then
@@ -282,6 +288,7 @@ OSM_AMENITY_AMENITIES=$amenities
 OSM_AMENITY_SHARD_PRECISION=$precision
 OSM_AMENITY_SHARD_CACHE_MB=$cache_mb
 OSM_AMENITY_UPDATE_INTERVAL_SECONDS=$update_seconds
+OSM_AMENITY_UPDATE_WORKERS=$update_workers
 OSM_AMENITY_REEXTRACT_EVERY_SECONDS=$rebuild_seconds
 LOG_VERBOSITY=$log_level
 ENV

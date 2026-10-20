@@ -333,6 +333,29 @@ During a catch-up, look for `update progress:` heartbeat entries about every 30
 seconds. They report the current phase, phase throughput, and ETA when the phase
 has a known total. The updater processes contiguous diffs as one atomic batch,
 so `/api/status` keeps the old cursor until validation and publication finish.
+Before applying a batch, it now reads every diff in sequence order and coalesces
+repeated changes for each typed OSM ID to the final event in that batch. A
+sequence ending in a deletion remains a deletion. This avoids doing baseline
+lookups and geometry work repeatedly for intermediate versions; it does not
+skip any replication diff or sequence. The coalescing stage writes a TSV spool
+and externally sorts it with GNU `sort` (configured for 32 MiB sort memory),
+then streams the final per-object events into the update. Temporary spool data
+is capped at 128 GiB in `work/update-diffs`; the sort also needs room for its
+sorted output and temporary files, so check free space before a large catch-up.
+The cap is a safety limit, not a disk-space reservation. Coalescing may reduce
+later work substantially when many diffs touch the same objects, but reading,
+sorting, and reducing a planet backlog still costs time and disk I/O. It does
+not establish that the updater will catch up with a live planet feed.
+Set `OSM_AMENITY_UPDATE_WORKERS` in `server.env` to select 1–16 concurrent
+update tasks (default 1). The updater distributes baseline PBF lookups and
+geometry builds after coalescing, resolves each task's dependencies against the
+same final object overlay, and merges results in stable ID order. A coordinator
+writes each affected shard once before validation and atomic publication. This
+setting is independent of extraction `--workers`. Higher values increase
+simultaneous `osmium cat` processes, temporary candidate PBFs, RAM use, and
+disk traffic. Start with 2–3 only if resources permit, then measure completed
+batch throughput and backlog reduction. Changing `server.env` takes effect
+when the updater process is restarted.
 After a batch publishes, `update catch-up assessment:` reports its end-to-end
 rate, how far the feed advanced during the run, and whether the remaining
 backlog shrank or grew. For a planet/minute feed, the backlog must shrink over

@@ -4,8 +4,8 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { finished } from 'node:stream/promises';
-import { parseOsmChange } from './change-parser.mjs';
-import { openDiffXml } from './replication.mjs';
+import readline from 'node:readline';
+import { coalesceDiffFiles } from './coalesce-diffs.mjs';
 import { DeltaObjectStore } from './delta-store.mjs';
 import { resolveCurrentObjects } from './object-resolver.mjs';
 import { withGenerationTransaction, atomicWrite } from './generation.mjs';
@@ -21,6 +21,19 @@ const MAX_CELLS = 5000;
 const MAX_REBUILD_BYTES = 64 * 1024 * 1024;
 const MAX_RESOLVED_BYTES = 64 * 1024 * 1024;
 const checkAborted = (signal) => { if (signal?.aborted) throw signal.reason ?? new Error('update aborted'); };
+const readUpdateWorkers = (value) => {
+  const count = Number(value ?? process.env.OSM_AMENITY_UPDATE_WORKERS ?? 1);
+  if (!Number.isSafeInteger(count) || count < 1 || count > 16) throw new Error('OSM_AMENITY_UPDATE_WORKERS must be an integer from 1 to 16');
+  return count;
+};
+
+/** Finish every task in a wave before returning an error, so shared readers stay open. */
+async function settledWave(tasks) {
+  const results = await Promise.allSettled(tasks);
+  const failed = results.find((item) => item.status === 'rejected');
+  if (failed) throw failed.reason;
+  return results.map((item) => item.value);
+}
 
 async function sortUniqueFile(input, output) {
   await new Promise((resolve, reject) => {
@@ -79,12 +92,12 @@ async function recountManifest(generation, manifest, amenities, onProgress = () 
   } finally { await fs.rm(temp, { recursive: true, force: true }); }
 }
 
-async function resolveMany(store, source, requests, onProgress = () => {}, progressPhase = 'resolving objects from baseline PBF') {
+async function resolveMany(store, source, requests, onProgress = () => {}, progressPhase = 'resolving objects from baseline PBF', workers = 1) {
   const resolved = new Map();
   let totalBytes = 0;
   const resolveBounded = async (part) => {
     try {
-      return await resolveCurrentObjects(store, source, part, { maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024 });
+      return await resolveCurrentObjects(store, source, part, { maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024, validateOverlays: true });
     } catch (error) {
       if (!/source candidate blocks require .* request a smaller lookup batch/.test(error.message) || part.length <= 1) throw error;
       const middle = Math.floor(part.length / 2);
@@ -95,17 +108,20 @@ async function resolveMany(store, source, requests, onProgress = () => {}, progr
     }
   };
   onProgress({ phase: progressPhase, completed: 0, total: requests.length, unit: 'objects' });
-  for (let i = 0; i < requests.length; i += REF_BATCH) {
-    const part = requests.slice(i, i + REF_BATCH);
-    const result = await resolveBounded(part);
-    for (const [key, value] of result.objects) {
-      if (!resolved.has(key)) {
-        totalBytes += Buffer.byteLength(JSON.stringify(value));
-        if (totalBytes > MAX_RESOLVED_BYTES) throw new Error(`resolved object cache exceeds ${MAX_RESOLVED_BYTES} bytes; reduce the update batch`);
-        resolved.set(key, value);
+  for (let i = 0; i < requests.length; i += REF_BATCH * workers) {
+    const parts = [];
+    for (let j = i; j < Math.min(i + REF_BATCH * workers, requests.length); j += REF_BATCH) parts.push(requests.slice(j, j + REF_BATCH));
+    const results = await settledWave(parts.map(resolveBounded));
+    for (const result of results) {
+      for (const [key, value] of result.objects) {
+        if (!resolved.has(key)) {
+          totalBytes += Buffer.byteLength(JSON.stringify(value));
+          if (totalBytes > MAX_RESOLVED_BYTES) throw new Error(`resolved object cache exceeds ${MAX_RESOLVED_BYTES} bytes; reduce the update batch`);
+          resolved.set(key, value);
+        }
       }
     }
-    onProgress({ phase: progressPhase, completed: Math.min(i + part.length, requests.length), total: requests.length, unit: 'objects', detail: `${resolved.size.toLocaleString('en-US')} objects resolved` });
+    onProgress({ phase: progressPhase, completed: Math.min(i + REF_BATCH * workers, requests.length), total: requests.length, unit: 'objects', detail: `${resolved.size.toLocaleString('en-US')} objects resolved with ${workers} workers` });
   }
   return resolved;
 }
@@ -202,7 +218,7 @@ async function buildMainGeometry(raw, store, source, elementCache, signal, onPro
     : cellsIntersectingBbox(south, west, north, east, Number(elementCache.precision)) };
 }
 
-async function applyAcceptedChanges(generation, changes, store, source, indexes, amenities, precision, buildSequence, signal, onProgress = () => {}) {
+async function applyAcceptedChanges(generation, changes, store, source, indexes, amenities, precision, buildSequence, signal, workers, onProgress = () => {}) {
   checkAborted(signal);
   if (!changes.length) return [];
   const affected = await affectedClosure(changes, indexes.reverseParents, onProgress);
@@ -239,15 +255,14 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
   }
   const changedIds = changes.map((o) => ({ type: o.type, id: o.id }));
   onProgress({ phase: 'resolving changed objects against baseline PBF', completed: 0, total: changedIds.length, unit: 'objects' });
-  const changedCurrent = await resolveMany(store, source, changedIds, onProgress, 'resolving changed objects against baseline PBF');
+  const changedCurrent = await resolveMany(store, source, changedIds, onProgress, 'resolving changed objects against baseline PBF', workers);
   const mainIds = new Set(oldMainIds);
   for (const change of changes) {
     const raw = changedCurrent.get(ID(change.type, change.id));
     if (raw?.tags?.amenity && amenities.includes(raw.tags.amenity)) mainIds.add(ID(raw.type, raw.id));
   }
   const mainRequests = [...mainIds].map((key) => { const [type, id] = key.split(':'); return { type, id: Number(id) }; });
-  const currentMains = await resolveMany(store, source, mainRequests, onProgress, 'resolving affected amenities against baseline PBF');
-  const cache = new Map(currentMains); cache.precision = precision;
+  const currentMains = await resolveMany(store, source, mainRequests, onProgress, 'resolving affected amenities against baseline PBF', workers);
   const newRows = new Map(); let buildBytes = 0;
   const estimatedBytes = (element) => Buffer.byteLength(JSON.stringify({ ...element, memberCoords: [...element.memberCoords] }));
   const addToCell = (cell, element) => {
@@ -264,17 +279,25 @@ async function applyAcceptedChanges(generation, changes, store, source, indexes,
   };
   let geometryCompleted = 0;
   onProgress({ phase: 'rebuilding affected amenity geometry', completed: 0, total: mainIds.size, unit: 'amenities' });
-  for (const key of mainIds) {
+  const mainKeys = [...mainIds].sort();
+  for (let offset = 0; offset < mainKeys.length; offset += workers) {
     checkAborted(signal);
-    const raw = currentMains.get(key);
-    if (!raw || !amenities.includes(raw.tags?.amenity)) continue;
-    const located = await buildMainGeometry(raw, store, source, cache, signal, onProgress);
-    for (const cell of located.cells) {
-      addToCell(cell, located.main);
-      for (const helper of located.helpers) addToCell(cell, helper);
+    const group = mainKeys.slice(offset, offset + workers);
+    const locations = await settledWave(group.map(async (key) => {
+      const raw = currentMains.get(key);
+      if (!raw || !amenities.includes(raw.tags?.amenity)) return null;
+      const cache = new Map([[key, raw]]);
+      cache.precision = precision;
+      return buildMainGeometry(raw, store, source, cache, signal, () => {});
+    }));
+    for (const located of locations) {
+      if (located) for (const cell of located.cells) {
+        addToCell(cell, located.main);
+        for (const helper of located.helpers) addToCell(cell, helper);
+      }
+      geometryCompleted += 1;
+      onProgress({ phase: 'rebuilding affected amenity geometry', completed: geometryCompleted, total: mainIds.size, unit: 'amenities', detail: `${workers} concurrent geometry tasks` });
     }
-    geometryCompleted += 1;
-    onProgress({ phase: 'rebuilding affected amenity geometry', completed: geometryCompleted, total: mainIds.size, unit: 'amenities' });
   }
   if (newRows.size + oldCells.size > MAX_CELLS) throw new Error(`update touches more than ${MAX_CELLS} total cells; split the update batch`);
 
@@ -351,14 +374,19 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
   sequence, replication, dataTimestamp = null, amenities = ['toilets'], shardPrecision = 5, engine = null,
   maxBatchObjects = 2000, maxBatchBytes = 8 * 1024 * 1024, beforePublish = null,
   sourcePbf: sourcePbfOverride = null, sourcePbfFingerprint = null, diffFiles = null,
-  candidateGenerationDir = null, fromSequence = null, signal = null, onProgress = () => {}
+  candidateGenerationDir = null, fromSequence = null, signal = null, onProgress = () => {}, updateWorkers = null
 }) {
   checkAborted(signal);
+  const workers = readUpdateWorkers(updateWorkers);
   if (!Number.isSafeInteger(sequence) || sequence <= 0) throw new Error('valid target sequence is required');
   const inputs = diffFiles ?? [diffFile];
   if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('at least one replication diff file is required');
   let completedDiffs = 0;
-  const reportProgress = (event) => onProgress({ ...event, batchCompletedDiffs: completedDiffs, batchTotalDiffs: inputs.length });
+  const reportProgress = (event) => {
+    if (Number.isSafeInteger(event.batchCompletedDiffs)) completedDiffs = event.batchCompletedDiffs;
+    onProgress({ ...event, batchCompletedDiffs: completedDiffs, batchTotalDiffs: inputs.length });
+  };
+  reportProgress({ phase: 'configuring update workers', completed: workers, total: workers, unit: 'workers', detail: `${workers} concurrent lookup and geometry tasks` });
   const overridePath = sourcePbfOverride ? path.resolve(sourcePbfOverride) : null;
   let actualOverrideFingerprint = sourcePbfFingerprint;
   if (sourcePbfOverride) {
@@ -375,6 +403,9 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
       actualOverrideFingerprint = hash.digest('hex');
     }
   }
+  const coalesced = await coalesceDiffFiles(inputs, path.join(pipelineDir, 'work', 'update-diffs'), { signal, onProgress: reportProgress });
+  const maxObjectTimestamp = coalesced.maxObjectTimestamp;
+  try {
   const affectedCells = new Set();
   const mutateGeneration = async (generation, activeRoot) => {
     const activeState = JSON.parse(await fs.readFile(path.join(activeRoot, 'state.json'), 'utf8'));
@@ -418,48 +449,60 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
       indexes = { dir: indexDir, partitions: tracked.partitions,
         objectCells: openPartitionedMultiIndex(path.join(indexDir, 'object-cells'), tracked.partitions),
         reverseParents: openPartitionedMultiIndex(path.join(indexDir, 'reverse-parents'), tracked.partitions) };
-      const batch = []; let batchBytes = 0; let changedCount = 0; let maxObjectTimestamp = 0;
+      const batch = []; let batchBytes = 0; let changedCount = 0;
       const changedIds = new Map();
-      let parsedObjects = 0;
+      let completedObjects = 0;
       const flush = async () => {
         if (!batch.length) return;
-        const before = await resolveMany(store, source, batch.map((o) => ({ type: o.type, id: o.id })), reportProgress, 'resolving replication objects against baseline PBF');
-        const newer = batch.filter((change) => (before.get(ID(change.type, change.id))?.version ?? 0) < change.version);
-        const results = await store.applyBatch(newer);
+        reportProgress({ phase: 'writing coalesced changes to delta store', completed: 0, total: batch.length, unit: 'objects', detail: `${completedObjects.toLocaleString('en-US')} of ${coalesced.uniqueCount.toLocaleString('en-US')} unique changes read` });
+        const results = await store.applyBatch(batch);
         const applied = new Set(results.filter((item) => item.applied).map((item) => `${item.key}@${item.version}`));
-        const accepted = newer.filter((item) => applied.has(`${ID(item.type, item.id)}@${item.version}`));
-        changedCount += accepted.length;
+        const accepted = batch.filter((item) => applied.has(`${ID(item.type, item.id)}@${item.version}`));
+        const relevant = [];
         for (const item of accepted) {
           const key = ID(item.type, item.id);
           const tracked = (await indexes.objectCells.get(key)).length > 0 || (await indexes.reverseParents.get(key)).length > 0;
           const configuredMain = item.tags?.amenity && amenities.includes(item.tags.amenity);
-          if (tracked || configuredMain) changedIds.set(key, { type: item.type, id: item.id, version: item.version, action: item.action });
+          if (tracked || configuredMain) relevant.push(item);
+        }
+        const baselineVersions = new Map();
+        for (let i = 0; i < relevant.length; i += REF_BATCH * workers) {
+          checkAborted(signal);
+          const parts = [];
+          for (let j = i; j < Math.min(i + REF_BATCH * workers, relevant.length); j += REF_BATCH) parts.push(relevant.slice(j, j + REF_BATCH));
+          const baselines = await settledWave(parts.map((part) => source.resolveObjects(part.map(({ type, id }) => ({ type, id })), {
+            maxRequests: REF_BATCH, maxCandidateBytes: 64 * 1024 * 1024, maxOutputBytes: 16 * 1024 * 1024
+          })));
+          for (const baseline of baselines) for (const object of baseline.objects) baselineVersions.set(ID(object.type, object.id), object.version);
+          reportProgress({ phase: 'checking relevant changes against baseline PBF', completed: Math.min(i + REF_BATCH * workers, relevant.length), total: relevant.length, unit: 'objects', detail: `${baselineVersions.size.toLocaleString('en-US')} baseline objects resolved with ${workers} workers` });
+        }
+        for (const item of relevant) {
+          if (item.version <= (baselineVersions.get(ID(item.type, item.id)) ?? 0)) continue;
+          changedCount += 1;
+          const key = ID(item.type, item.id);
+          changedIds.set(key, { type: item.type, id: item.id, version: item.version, action: item.action });
         }
         if (changedIds.size > MAX_AFFECTED) throw new Error(`diff changes exceed ${MAX_AFFECTED} tracked objects; use a smaller replication interval`);
         batch.length = 0; batchBytes = 0;
+        reportProgress({ phase: 'applying coalesced changes', completed: completedObjects, total: coalesced.uniqueCount, unit: 'objects', detail: `${changedIds.size.toLocaleString('en-US')} tracked objects or configured amenities` });
       };
-      reportProgress({ phase: 'parsing downloaded replication diffs', completed: 0, total: inputs.length, unit: 'diffs' });
-      for (const input of inputs) {
+      let parsedObjects = 0;
+      reportProgress({ phase: 'applying coalesced changes', completed: 0, total: coalesced.uniqueCount, unit: 'objects', detail: `${coalesced.eventCount.toLocaleString('en-US')} events reduced to final object states` });
+      const changes = readline.createInterface({ input: createReadStream(coalesced.file), crlfDelay: Infinity });
+      for await (const line of changes) {
         checkAborted(signal);
-        for await (const change of parseOsmChange(openDiffXml(input, { signal }))) {
-          checkAborted(signal);
-          if (change.timestamp > maxObjectTimestamp) maxObjectTimestamp = change.timestamp;
-          const size = Buffer.byteLength(JSON.stringify(change));
-          if (size > maxBatchBytes) throw new Error(`change ${change.type}:${change.id} exceeds update batch byte limit`);
-          if (batch.length >= maxBatchObjects || batchBytes + size > maxBatchBytes) await flush();
-          batch.push(change); batchBytes += size;
-          parsedObjects += 1;
-          if (parsedObjects % 10000 === 0) {
-            reportProgress({ phase: 'parsing downloaded replication diffs', completed: completedDiffs, total: inputs.length, unit: 'diffs', detail: `${parsedObjects.toLocaleString('en-US')} OSM changes parsed; current ${path.basename(input)}` });
-          }
-        }
-        checkAborted(signal); await flush();
-        completedDiffs += 1;
-        reportProgress({ phase: 'parsing downloaded replication diffs', completed: completedDiffs, total: inputs.length, unit: 'diffs', detail: `${parsedObjects.toLocaleString('en-US')} OSM changes parsed` });
+        const change = JSON.parse(line);
+        const size = Buffer.byteLength(line);
+        if (size > maxBatchBytes) throw new Error(`change ${change.type}:${change.id} exceeds update batch byte limit`);
+        if (batch.length >= maxBatchObjects || batchBytes + size > maxBatchBytes) await flush();
+        batch.push(change); batchBytes += size;
+        parsedObjects += 1;
+        completedObjects = parsedObjects;
       }
+      checkAborted(signal); await flush();
       checkAborted(signal);
       if (changedIds.size) {
-        const rebuilt = await applyAcceptedChanges(generation, [...changedIds.values()], store, source, indexes, amenities, shardPrecision, sequence, signal, reportProgress);
+        const rebuilt = await applyAcceptedChanges(generation, [...changedIds.values()], store, source, indexes, amenities, shardPrecision, sequence, signal, workers, reportProgress);
         for (const cell of rebuilt.cells) affectedCells.add(cell);
       }
       reportProgress({ phase: 'preparing updated manifest', completed: 0, total: null, unit: 'steps', detail: `${affectedCells.size.toLocaleString('en-US')} affected shards` });
@@ -508,6 +551,9 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
     onProgress: reportProgress
   }));
   return result;
+  } finally {
+    await coalesced.cleanup();
+  }
 }
 
 /** Apply a contiguous batch to the active generation or an inactive candidate. */

@@ -4,15 +4,26 @@ export async function resolveCurrentObjects(deltaStore, sourceIndex, requests, o
   if (requests.length > maxRequests) throw new Error(`object resolver batch exceeds ${maxRequests} IDs`);
   const unique = new Map();
   for (const request of requests) unique.set(`${request.type}:${request.id}`, request);
-  const result = new Map(); const baselineRequests = [];
+  const result = new Map(); const baselineRequests = []; const overlays = new Map();
   for (const [key, request] of unique) {
     const overlay = await deltaStore.get(request.type, request.id);
     if (!overlay) baselineRequests.push(request);
+    else if (options.validateOverlays) { overlays.set(key, overlay); baselineRequests.push(request); }
     else if (!overlay.deleted) result.set(key, overlay);
   }
+  let baselineByKey = new Map();
   if (baselineRequests.length) {
     const baseline = await sourceIndex.resolveObjects(baselineRequests, options);
-    for (const object of baseline.objects) result.set(`${object.type}:${object.id}`, object);
+    baselineByKey = new Map(baseline.objects.map((object) => [`${object.type}:${object.id}`, object]));
+    for (const [key, request] of unique) {
+      const overlay = overlays.get(key);
+      const base = baselineByKey.get(key);
+      if (overlay) {
+        if (overlay.version > (base?.version ?? 0)) {
+          if (!overlay.deleted) result.set(key, overlay);
+        } else if (base) result.set(key, base);
+      } else if (base) result.set(key, base);
+    }
   }
   return {
     objects: result,
