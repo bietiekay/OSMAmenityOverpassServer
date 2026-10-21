@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
@@ -97,6 +98,7 @@ export class DeltaObjectStore {
     if (!Number.isSafeInteger(bucket) || bucket < 0 || bucket >= PARTITIONS) throw new Error(`invalid delta partition ${bucket}`);
     const values = await this.load(bucket);
     let applied = 0;
+    const accepted = new Map();
     for (const change of changes) {
       valid(change.type, change.id);
       if (!Number.isSafeInteger(change.version) || change.version < 1) throw new Error(`invalid version for ${change.type}:${change.id}`);
@@ -108,23 +110,38 @@ export class DeltaObjectStore {
         ? { type: change.type, id: change.id, version: change.version, deleted: true }
         : { ...change, action: undefined, deleted: false };
       values.set(key, record);
+      accepted.set(key, record);
       applied += 1;
     }
     if (!applied) return 0;
     const file = this.file(bucket);
     const temp = `${file}.${randomUUID()}.bulk`;
-    let output = ''; let outputBytes = 0;
-    for (const value of values.values()) {
-      const line = `${JSON.stringify(value)}\n`;
-      outputBytes += Buffer.byteLength(line);
-      if (outputBytes > this.maxPartitionBytes) throw new Error(`compacted delta partition ${bucket} exceeds ${this.maxPartitionBytes} bytes`);
-      output += line;
-    }
+    const additions = [...accepted.values()].map((record) => `${JSON.stringify(record)}\n`).join('');
+    const existingSize = (await fs.stat(file).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error)))?.size ?? 0;
+    const appendFits = existingSize + Buffer.byteLength(additions) <= this.maxPartitionBytes;
     await fs.mkdir(this.dir, { recursive: true });
     try {
-      const handle = await fs.open(temp, 'wx');
-      try { await handle.writeFile(output); if (sync) await handle.sync(); }
-      finally { await handle.close(); }
+      if (appendFits) {
+        if (existingSize) {
+          // The active generation may hardlink this file. Copy its bytes in the
+          // filesystem, then append only new versions to the private copy.
+          await fs.copyFile(file, temp, fsConstants.COPYFILE_EXCL);
+          await fs.appendFile(temp, additions);
+        } else await fs.writeFile(temp, additions, { flag: 'wx' });
+      } else {
+        let output = ''; let outputBytes = 0;
+        for (const value of values.values()) {
+          const line = `${JSON.stringify(value)}\n`;
+          outputBytes += Buffer.byteLength(line);
+          if (outputBytes > this.maxPartitionBytes) throw new Error(`compacted delta partition ${bucket} exceeds ${this.maxPartitionBytes} bytes`);
+          output += line;
+        }
+        await fs.writeFile(temp, output, { flag: 'wx' });
+      }
+      if (sync) {
+        const handle = await fs.open(temp, 'r');
+        try { await handle.sync(); } finally { await handle.close(); }
+      }
       await fs.rename(temp, file);
     } catch (error) { await fs.rm(temp, { force: true }); throw error; }
     this.cache.clear(); this.cacheBytes = 0;
