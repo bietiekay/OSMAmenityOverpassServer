@@ -42,7 +42,9 @@ Extraction `--data-dir` means the **pipeline root**. Server
 generations on the same local filesystem for atomic publication and hardlinks.
 Generation locking requires working Linux `flock` semantics. Leave disk space
 for retained sources, extraction work, update indexes, candidates, and old
-generations. There is no automatic generation garbage collector.
+generations. The updater keeps two published generations by default, including
+the active one, and removes older ones after a one-hour grace period. Set
+`OSM_AMENITY_GENERATIONS_TO_KEEP` to a larger value for more rollback points.
 
 The successful Japan resume used a 2.55 GB source, about 4.32 GB of sampled
 pipeline storage, and 1,096.40 MiB peak process-tree RSS. These are measurements
@@ -378,8 +380,9 @@ After a successful update or an up-to-date feed check, cleanup removes leftover
 update/re-extract diff files through the published cursor and abandoned
 coalescing, re-extract work, staging, and PBF-lookup directories from before
 that run. Cleanup takes the generation
-lock and only removes known temporary name patterns. Active and older published
-generations, retained PBFs, and reusable source indexes remain. Cleanup errors
+lock and only removes known temporary name patterns. Published generation
+retention keeps the active and newest predecessor by default and removes older
+ones after a one-hour grace period. Retained PBFs and reusable source indexes remain. Cleanup errors
 are logged; a published cursor is not rolled back for a cleanup failure.
 After a batch publishes, `update catch-up assessment:` reports its end-to-end
 rate, how far the feed advanced during the run, and whether the remaining
@@ -448,11 +451,12 @@ source PBF. Restarting automatically attempts catch-up again. If investigating
 an updater defect, keep the service stopped until the application problem is
 resolved. Do not repair individual active files or hand-adjust sequence numbers.
 
-Remove old generations only during a maintenance stop after checking the active
-symlink, backup retention, and rollback needs. Queries pin generation paths;
-deleting an old directory while requests still use it can break those requests.
-There is no provided online garbage collector. Never delete the active generation
-or its source snapshot.
+The updater prunes published generations under the generation lock. It always
+keeps the active generation and at least one other, and delays deletion by one
+hour because queries pin generation paths. A very long-running request that
+outlives this grace period can still fail if its pinned generation is removed.
+Keep offline backups for longer rollback retention. Never delete the active
+generation or its source snapshot.
 
 ## 10. Troubleshooting
 

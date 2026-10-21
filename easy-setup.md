@@ -329,6 +329,7 @@ OSM_AMENITY_AMENITIES=toilets
 OSM_AMENITY_SHARD_PRECISION=5
 OSM_AMENITY_SHARD_CACHE_MB=256
 OSM_AMENITY_UPDATE_INTERVAL_SECONDS=3600
+OSM_AMENITY_GENERATIONS_TO_KEEP=2
 OSM_AMENITY_REEXTRACT_EVERY_SECONDS=604800
 LOG_VERBOSITY=info
 ENV
@@ -626,7 +627,11 @@ dc up -d amenity-server
 ```
 
 Monitor free disk space/inodes, container memory, update errors, and the data
-timestamp. Old immutable generations are **not** automatically deleted.
+timestamp. The updater retains at least two published generations by default,
+including the active one. Older published generations are removed after a
+one-hour grace period during successful updater cleanup. Set
+`OSM_AMENITY_GENERATIONS_TO_KEEP` higher to retain more rollback points.
+Keep backups separately; retention does not protect them.
 The geometry member-object cache currently has no aggregate memory cap, and
 updates validate/recount the full shard inventory. Japan results do not
 establish planet memory bounds or sustained update throughput.
@@ -653,9 +658,10 @@ Do not rerun the initial extraction against an already updated active pipeline.
 For a consistent backup, stop the service and archive the entire pipeline,
 retained source PBFs, `/srv/osm-amenity/server.env`, your Compose file, and the
 application Git revision. Preserve symlinks and hardlinks, verify restoration,
-then start the service again. Remove old generations only during a maintenance
-stop after checking the active `data` symlink and backup/rollback requirements.
-Never remove the active generation or a PBF it needs.
+then start the service again. The updater manages old published generations;
+manual removal should be done only during a maintenance stop after checking
+the active `data` symlink and backup/rollback requirements. Never remove the
+active generation or a PBF it needs.
 
 For detailed backup, rollback, and troubleshooting procedures, see
 [OPERATIONS.md](docs/OPERATIONS.md). For supported query syntax, see

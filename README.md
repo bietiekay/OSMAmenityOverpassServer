@@ -55,6 +55,7 @@ requests instead of returning a misleading empty success.
 | `OSM_AMENITY_SHARD_PRECISION` | `5` | Geohash precision, 3 through 7 |
 | `OSM_AMENITY_SHARD_CACHE_MB` | `256` | In-memory shard LRU limit |
 | `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Watch-mode batching window and maximum wait after the last published update; `7200` groups about 120 planet-minute diffs |
+| `OSM_AMENITY_GENERATIONS_TO_KEEP` | `2` | Minimum number of published generations to retain, including the active one (minimum 2); older ones are deleted after a one-hour grace period |
 | `OSM_AMENITY_UPDATE_WORKERS` | `1` | Concurrent update lookup and geometry tasks (1–16) |
 | `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Replication namespace root; Geofabrik host implies regional/day, otherwise planet/minute |
 | `OSM_AMENITY_SOURCE_PBF` | unset | Optional retained PBF path for updater re-extract; mounted path can differ from the source path recorded at build |
@@ -207,9 +208,9 @@ copy of all changed objects.
 After a successful catch-up or an up-to-date check, the updater removes leftover
 downloaded update/re-extract diffs through the published sequence and abandoned
 coalescing, re-extract work, staging-generation, and PBF-lookup directories
-from earlier runs. It leaves
-the active and older published generations, retained source PBF, and reusable
-source indexes in place. A cleanup failure is logged without undoing an
+from earlier runs. It retains the active and newest rollback generation by
+default and deletes older published generations after a one-hour grace period.
+Retained source PBFs and reusable source indexes remain. A cleanup failure is logged without undoing an
 already published update.
 
 The line pipeline is partitioned and bounded in its lookups, but Japan success
@@ -227,8 +228,8 @@ by that per-lookup limit. A batch exceeding a checked limit
 fails without advancing the cursor; reduce the update interval or use a newer
 baseline. These checks do not establish planet memory bounds or throughput.
 Retain the baseline PBF unchanged while it serves updates; provide a newer
-snapshot through a separate re-extract path. Old immutable generations currently
-require operator-managed retention and disk capacity.
+snapshot through a separate re-extract path. Keep separate backups if older
+generations are needed; the online retention policy is not a backup.
 
 While a catch-up is running, the updater emits a progress heartbeat about every
 30 seconds. Logs identify the current phase (source-PBF hashing/indexing, diff

@@ -80,7 +80,8 @@ export const main = async (dependencies: MainDependencies = {}): Promise<void> =
       dataDir: config.dataDir,
       amenities: config.amenities,
       shardPrecision: config.shardPrecision,
-      updateIntervalSeconds: config.updateIntervalSeconds
+      updateIntervalSeconds: config.updateIntervalSeconds,
+      generationsToKeep: config.generationsToKeep
     },
     'osm-amenity-overpass-server listening'
   );

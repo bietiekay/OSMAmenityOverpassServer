@@ -95,6 +95,7 @@ function delay(ms, signal) {
 export function createUpdateWorker({
   pipelineDir, replication, sourcePbf = null,
   amenities = ['toilets'], shardPrecision = 5, updateIntervalSeconds = 3600,
+  generationsToKeep = 2,
   reextractEverySeconds = 604800, reextractSourcePbf = null,
   fetchImpl = undiciFetch, fetchState = fetchReplicationState, download = downloadDiff,
   apply = applyDiffGeneration, checkReextract = maybeRunReextract,
@@ -105,8 +106,8 @@ export function createUpdateWorker({
 
   const cleanupAfterSuccess = async (olderThanMs, publishedSequence) => {
     try {
-      const removed = await cleanupOrphanedUpdateData(root, { olderThanMs, publishedSequence });
-      if (Object.values(removed).some(Boolean)) onLog(`update cleanup: removed ${removed.diffs} leftover diffs, ${removed.coalesceDirs} coalescing directories, ${removed.reextractDirs} re-extract directories, ${removed.stagingDirs} staging generations, ${removed.lookupDirs} lookup directories, ${removed.attestations} attestation files, ${removed.linkTemps} temporary links`);
+      const removed = await cleanupOrphanedUpdateData(root, { olderThanMs, publishedSequence, generationsToKeep, onProgress: onLog });
+      if (Object.values(removed).some(Boolean)) onLog(`update cleanup: removed ${removed.diffs} leftover diffs, ${removed.coalesceDirs} coalescing directories, ${removed.reextractDirs} re-extract directories, ${removed.stagingDirs} staging generations, ${removed.lookupDirs} lookup directories, ${removed.attestations} attestation files, ${removed.linkTemps} temporary links, ${removed.publishedGenerations} old published generations`);
     } catch (error) {
       onLog(`update cleanup skipped: ${error.message}`);
     }
@@ -143,6 +144,7 @@ export function createUpdateWorker({
       if (gap < targetDiffs && Number.isFinite(lastUpdateMs) && lastUpdateMs <= now && dueAt > now) {
         const retryAfterMs = Math.min(dueAt - now, BATCH_FEED_CHECK_SECONDS * 1000);
         onLog(`update batching: ${gap}/${targetDiffs} ${replication.interval} diffs pending; next feed check in ${formatDuration(retryAfterMs / 1000)}; update due by ${new Date(dueAt).toISOString()}`);
+        await cleanupAfterSuccess(runStartedAt, cursor);
         return { fromSequence: cursor, toSequence: cursor, changedCount: 0, cells: [], remainingGap: gap, deferred: true, retryAfterMs };
       }
     }
@@ -220,6 +222,7 @@ export function createUpdateWorker({
           const rebuilt = await checkReextract({ dataDir: root, sourcePbf: rebuildPbf, amenities, shardPrecision,
             replication, intervalSeconds: reextractEverySeconds, signal });
           if (rebuilt) onLog(`weekly re-extract activated sequence ${rebuilt.sequenceNumber}`);
+          if (rebuilt) await cleanupAfterSuccess(Date.now(), rebuilt.sequenceNumber);
         } catch (error) { if (!signal?.aborted) onError(error); }
       }
       if (signal?.aborted) break;
@@ -256,7 +259,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const worker = createUpdateWorker({ pipelineDir, replication, sourcePbf,
     reextractSourcePbf: config.reextractSourcePbf ? path.resolve(config.reextractSourcePbf) : null,
     amenities: config.amenities, shardPrecision: config.shardPrecision,
-    updateIntervalSeconds: config.updateIntervalSeconds, reextractEverySeconds: config.reextractEverySeconds });
+    updateIntervalSeconds: config.updateIntervalSeconds, generationsToKeep: config.generationsToKeep,
+    reextractEverySeconds: config.reextractEverySeconds });
   if (!argv.includes('--watch')) return worker.runOnce();
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('update worker stopping'));

@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { withGenerationLock } from './generation.mjs';
 
+const GENERATION_GRACE_MS = 60 * 60 * 1000;
+
 const entries = async (directory) => fs.readdir(directory, { withFileTypes: true })
   .catch((error) => error.code === 'ENOENT' ? [] : Promise.reject(error));
 
@@ -43,10 +45,55 @@ async function removeOldFiles(directory, pattern, olderThanMs) {
   return removed;
 }
 
-/** Remove only abandoned update work after the active cursor has been published. */
-export async function cleanupOrphanedUpdateData(pipelineDir, { olderThanMs, publishedSequence }) {
-  if (!Number.isFinite(olderThanMs) || !Number.isSafeInteger(publishedSequence) || publishedSequence < 1) {
-    throw new Error('update cleanup requires a run start time and a published sequence');
+async function prunePublishedGenerations(pipelineDir, activeRoot, keepCount, onProgress) {
+  const directory = path.join(pipelineDir, 'data-generations');
+  const generationRoot = await fs.realpath(directory);
+  if (path.dirname(activeRoot) !== generationRoot) throw new Error('active generation is outside data-generations; retention skipped');
+  const candidates = [];
+  for (const entry of await entries(generationRoot)) {
+    if (!entry.isDirectory()) continue;
+    const update = /^update-(\d+)-[0-9a-f-]+$/.exec(entry.name);
+    const build = /^build-[0-9a-f]{64}-[0-9a-f-]+$/.test(entry.name);
+    const reextract = /^reextract-[0-9a-f-]+$/.test(entry.name);
+    if (!update && !build && !reextract) continue;
+    const target = path.join(generationRoot, entry.name);
+    const stat = await fs.lstat(target);
+    if (!stat.isDirectory()) continue;
+    const state = await fs.readFile(path.join(target, 'state.json'), 'utf8').then(JSON.parse).catch(() => null);
+    const manifest = await fs.readFile(path.join(target, 'manifest.json'), 'utf8').then(JSON.parse).catch(() => null);
+    if (!Number.isSafeInteger(state?.replication?.sequenceNumber) || !Array.isArray(manifest?.shards)) continue;
+    // A re-extract is moved into data-generations before activation. Its
+    // completion marker distinguishes a published generation from that work.
+    const markerTime = update ? Number(update[1]) : reextract ? Date.parse(state.lastReextractAt ?? '') : stat.mtimeMs;
+    if (!Number.isFinite(markerTime) || markerTime <= 0) continue;
+    // The update ID records transaction start, not publication. The directory
+    // ctime advances when it is renamed into its published location, so use
+    // the later time for the in-flight-query grace period.
+    const publishedAt = Math.max(markerTime, stat.ctimeMs);
+    candidates.push({ target, name: entry.name, publishedAt });
+  }
+  candidates.sort((left, right) => right.publishedAt - left.publishedAt || right.name.localeCompare(left.name));
+  const kept = new Set([activeRoot]);
+  for (const candidate of candidates) {
+    if (kept.size >= keepCount) break;
+    kept.add(candidate.target);
+  }
+  const cutoff = Date.now() - GENERATION_GRACE_MS;
+  const obsolete = candidates.filter((candidate) => !kept.has(candidate.target) && candidate.publishedAt < cutoff);
+  let removed = 0;
+  for (const candidate of obsolete) {
+    onProgress(`generation retention: removing ${candidate.name} (${removed + 1}/${obsolete.length})`);
+    await fs.rm(candidate.target, { recursive: true });
+    removed += 1;
+  }
+  return removed;
+}
+
+/** Remove abandoned update work and old published generations under the generation lock. */
+export async function cleanupOrphanedUpdateData(pipelineDir, { olderThanMs, publishedSequence, generationsToKeep = 2, onProgress = () => {} }) {
+  if (!Number.isFinite(olderThanMs) || !Number.isSafeInteger(publishedSequence) || publishedSequence < 1 ||
+      !Number.isSafeInteger(generationsToKeep) || generationsToKeep < 2) {
+    throw new Error('update cleanup requires a run start time, a published sequence, and at least two retained generations');
   }
   return withGenerationLock(pipelineDir, async () => {
     const activeRoot = await fs.realpath(path.join(pipelineDir, 'data'));
@@ -56,7 +103,7 @@ export async function cleanupOrphanedUpdateData(pipelineDir, { olderThanMs, publ
     }
     const workRoot = path.join(pipelineDir, 'work');
     const workDir = path.join(workRoot, 'update-diffs');
-    const removed = { diffs: 0, coalesceDirs: 0, reextractDirs: 0, stagingDirs: 0, lookupDirs: 0, attestations: 0, linkTemps: 0 };
+    const removed = { diffs: 0, coalesceDirs: 0, reextractDirs: 0, stagingDirs: 0, lookupDirs: 0, attestations: 0, linkTemps: 0, publishedGenerations: 0 };
     removed.diffs += await removePublishedDiffs(
       workDir, /^([1-9]\d*)\.osc\.gz(?:\.[0-9a-f-]+\.tmp)?$/, publishedSequence
     );
@@ -86,6 +133,7 @@ export async function cleanupOrphanedUpdateData(pipelineDir, { olderThanMs, publ
       await fs.rm(target, { force: true });
       removed.linkTemps += 1;
     }
+    removed.publishedGenerations = await prunePublishedGenerations(pipelineDir, activeRoot, generationsToKeep, onProgress);
     return removed;
   });
 }
