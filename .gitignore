@@ -13,3 +13,4 @@ fixtures/
 build.sh
 start.sh
 stop.sh
+taillog.sh
