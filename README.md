@@ -54,7 +54,7 @@ requests instead of returning a misleading empty success.
 | `OSM_AMENITY_AMENITIES` | `toilets` | Comma-separated configured amenity values |
 | `OSM_AMENITY_SHARD_PRECISION` | `5` | Geohash precision, 3 through 7 |
 | `OSM_AMENITY_SHARD_CACHE_MB` | `256` | In-memory shard LRU limit |
-| `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Update-loop wake cadence |
+| `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Watch-mode batching window and maximum wait after the last published update; `7200` groups about 120 planet-minute diffs |
 | `OSM_AMENITY_UPDATE_WORKERS` | `1` | Concurrent update lookup and geometry tasks (1–16) |
 | `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Replication namespace root; Geofabrik host implies regional/day, otherwise planet/minute |
 | `OSM_AMENITY_SOURCE_PBF` | unset | Optional retained PBF path for updater re-extract; mounted path can differ from the source path recorded at build |
@@ -155,6 +155,16 @@ do not prove public Overpass parity, crash recovery in every failure mode, or
 planet-scale resource bounds. Regional Geofabrik inputs use their own daily
 namespace and sequence.
 
+The watch loop collects small near-head batches until the configured update
+interval has elapsed since the last publication, or until the pending diff
+count reaches one interval of minute/day diffs. While a small backlog is
+pending, it checks the feed every five minutes; when fully caught up, it
+waits for the configured interval. It applies a large backlog immediately.
+Explicit one-shot updater runs still apply available diffs immediately. For example,
+`OSM_AMENITY_UPDATE_INTERVAL_SECONDS=7200` targets roughly two-hour batches on
+the planet minute feed. After an error, the next check occurs within five
+minutes. Larger windows reduce per-generation work but increase data age.
+
 Before applying a contiguous diff batch, the updater coalesces changes for the
 same typed OSM ID (node, way, or relation) and keeps only that object's final
 state in the batch. Diff files are still read in sequence order, and the latest
@@ -236,8 +246,8 @@ diff-processing rate across several log entries. Phase ETAs are estimates for
 that phase, not a promise for the complete update. The active replication cursor
 is still published only after the whole batch validates and activates. After
 publication, a catch-up assessment reports the completed batch rate and how much
-the feed advanced during the run. If diffs remain, the updater starts another
-catch-up cycle immediately instead of waiting for the regular hourly check.
+the feed advanced during the run. If diffs remain, the updater checks whether
+the next batch should start immediately or wait for the configured window.
 
 ## Docker packaging
 

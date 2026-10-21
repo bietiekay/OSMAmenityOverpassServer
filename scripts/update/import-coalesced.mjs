@@ -92,7 +92,10 @@ export async function importCoalescedPartitions(store, file, total, { workers = 
   const flushWave = async () => {
     if (!wave.length) return;
     checkAborted(signal);
-    const values = await settledWave(wave.map((group) => store.applyPartition(group.bucket, group.changes)));
+    // This import writes only an unpublished candidate. Its complete tree is
+    // synced before the active generation link is switched, so syncing every
+    // small partition here would repeat thousands of disk flushes.
+    const values = await settledWave(wave.map((group) => store.applyPartition(group.bucket, group.changes, { sync: false })));
     for (let i = 0; i < wave.length; i += 1) { completed += wave[i].changes.length; applied += values[i]; }
     wave.length = 0;
     onProgress({ phase: 'writing grouped delta partitions', completed, total, unit: 'objects', detail: `${applied.toLocaleString('en-US')} newer overlay versions; ${workers} workers` });

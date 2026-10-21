@@ -487,10 +487,16 @@ the Docker daemon returns after a host reboot, provided you did not explicitly
 stop it. Ensure the Docker daemon itself starts at boot using your host's
 existing Docker setup.
 
-The server starts its own updater. It catches up on startup, then sleeps for
-the configured interval (3600 seconds here). Do not add a cron job or a second
-updater container. The first catch-up can take substantial time and scan/hash
-the retained PBF to build source lookup indexes.
+The server starts its own updater. In watch mode it collects small near-head
+diffs for the configured update window (3600 seconds here). While a small
+backlog is pending, it checks the feed every five minutes; when fully caught
+up, it waits for the configured interval. A larger backlog starts immediately.
+Set
+`OSM_AMENITY_UPDATE_INTERVAL_SECONDS=7200` in the generated `server.env` for
+roughly two-hour planet-minute batches. The setting bounds the wait since the
+last successful publication; the update itself adds processing time. Do not
+add a cron job or a second updater container. The first catch-up can take
+substantial time and scan/hash the retained PBF to build source lookup indexes.
 
 In another shell, run the included HTTP checks:
 

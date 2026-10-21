@@ -93,7 +93,7 @@ export class DeltaObjectStore {
   }
 
   /** Replace one candidate-generation partition after an externally grouped import. */
-  async applyPartition(bucket, changes) {
+  async applyPartition(bucket, changes, { sync = true } = {}) {
     if (!Number.isSafeInteger(bucket) || bucket < 0 || bucket >= PARTITIONS) throw new Error(`invalid delta partition ${bucket}`);
     const values = await this.load(bucket);
     let applied = 0;
@@ -123,7 +123,7 @@ export class DeltaObjectStore {
     await fs.mkdir(this.dir, { recursive: true });
     try {
       const handle = await fs.open(temp, 'wx');
-      try { await handle.writeFile(output); await handle.sync(); }
+      try { await handle.writeFile(output); if (sync) await handle.sync(); }
       finally { await handle.close(); }
       await fs.rename(temp, file);
     } catch (error) { await fs.rm(temp, { force: true }); throw error; }

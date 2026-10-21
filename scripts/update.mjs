@@ -13,6 +13,7 @@ import { cleanupOrphanedUpdateData } from './update/cleanup.mjs';
 
 const MAX_DIFFS = 100000;
 const MAX_DIFF_BYTES = 2 * 1024 * 1024 * 1024;
+const BATCH_FEED_CHECK_SECONDS = 300;
 const formatBytes = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 
 export function pipelineRoot(dataDir) {
@@ -111,7 +112,7 @@ export function createUpdateWorker({
     }
   };
 
-  async function runOnce(signal = undefined) {
+  async function runOnce(signal = undefined, { batchWindowSeconds = 0 } = {}) {
     if (signal?.aborted) throw abortError(signal);
     const runStartedAt = Date.now();
     const progress = createProgressLogger(onLog);
@@ -129,6 +130,21 @@ export function createUpdateWorker({
       onLog(`up to date at ${cursor}`);
       await cleanupAfterSuccess(runStartedAt, cursor);
       return { fromSequence: cursor, toSequence: cursor, changedCount: 0, cells: [] };
+    }
+    // A one-shot update remains immediate. In watch mode, small near-head
+    // batches wait until enough diffs accumulate or the freshness window ends.
+    // Poll the feed cheaply during that wait so a growing backlog is noticed.
+    if (batchWindowSeconds > 0) {
+      const diffSeconds = replication.interval === 'day' ? 86400 : 60;
+      const targetDiffs = Math.max(1, Math.ceil(batchWindowSeconds / diffSeconds));
+      const lastUpdateMs = Date.parse(state.lastUpdate ?? '');
+      const now = Date.now();
+      const dueAt = lastUpdateMs + batchWindowSeconds * 1000;
+      if (gap < targetDiffs && Number.isFinite(lastUpdateMs) && lastUpdateMs <= now && dueAt > now) {
+        const retryAfterMs = Math.min(dueAt - now, BATCH_FEED_CHECK_SECONDS * 1000);
+        onLog(`update batching: ${gap}/${targetDiffs} ${replication.interval} diffs pending; next feed check in ${formatDuration(retryAfterMs / 1000)}; update due by ${new Date(dueAt).toISOString()}`);
+        return { fromSequence: cursor, toSequence: cursor, changedCount: 0, cells: [], remainingGap: gap, deferred: true, retryAfterMs };
+      }
     }
     const catchUpStartedAt = Date.now();
     onLog(`update catch-up: local sequence ${cursor}, feed sequence ${latest.sequenceNumber}, backlog ${gap} ${replication.interval} diffs`);
@@ -193,8 +209,10 @@ export function createUpdateWorker({
 
   async function runWatch({ signal, checkIntervalSeconds = updateIntervalSeconds } = {}) {
     while (!signal?.aborted) {
-      let remainingGap = null;
-      try { remainingGap = (await runOnce(signal)).remainingGap; } catch (error) { if (!signal?.aborted) onError(error); }
+      let result = null;
+      let failed = false;
+      try { result = await runOnce(signal, { batchWindowSeconds: checkIntervalSeconds }); }
+      catch (error) { failed = true; if (!signal?.aborted) onError(error); }
       if (!signal?.aborted) {
         try {
           let rebuildPbf = reextractSourcePbf ?? sourcePbf;
@@ -205,11 +223,16 @@ export function createUpdateWorker({
         } catch (error) { if (!signal?.aborted) onError(error); }
       }
       if (signal?.aborted) break;
-      if (remainingGap > 0) {
-        onLog(`replication backlog remains at ${remainingGap} diffs; starting the next catch-up cycle immediately`);
+      if (result?.deferred) {
+        try { await delay(result.retryAfterMs, signal); } catch { break; }
         continue;
       }
-      try { await delay(checkIntervalSeconds * 1000, signal); } catch { break; }
+      if (result?.remainingGap > 0) {
+        onLog(`replication backlog remains at ${result.remainingGap} diffs; checking whether to batch or catch up immediately`);
+        continue;
+      }
+      const waitSeconds = failed ? Math.min(checkIntervalSeconds, BATCH_FEED_CHECK_SECONDS) : checkIntervalSeconds;
+      try { await delay(waitSeconds * 1000, signal); } catch { break; }
     }
   }
 

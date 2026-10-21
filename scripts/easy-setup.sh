@@ -234,7 +234,11 @@ else
   printf 'Default 5 is a practical balance. Keep the same precision in the server and imported index.\n'
   ask_int precision 'Geographic shard precision (3-7; default 5)' 5 3 7
   ask_int cache_mb 'HTTP shard cache (MiB)' 256 1 1048576
-  ask_int update_seconds 'Update-loop sleep interval (seconds)' 3600 1 31536000
+  printf 'Update interval: near the planet minute feed, small diffs are collected into one batch until this window ends.\n'
+  printf 'With a small backlog the feed is checked every 5 minutes; when fully caught up, after the configured interval.\n'
+  printf 'A backlog of at least one window of diffs starts immediately.\n'
+  printf 'For roughly two-hour updates, enter 7200 (about 120 minute diffs). Larger windows reduce generation writes but age the served data.\n'
+  ask_int update_seconds 'Update batching window / maximum wait (seconds)' 3600 1 31536000
   ask_int rebuild_seconds 'Weekly drift rebuild interval (seconds)' 604800 1 31536000
   while true; do
     ask log_level 'Log verbosity: errors, info, debug' info
@@ -272,7 +276,7 @@ else
   printf 'Proxy upstream: %s\nFallbacks: %s\nAmenities: %s; precision: %s\n' "$proxy_url" "${fallbacks:-none}" "$amenities" "$precision"
   printf 'Import: %s MiB RAM, %s workers x %s MiB; chunks %s MiB\n' "$ram_mb" "$workers" "$worker_mb" "$chunk_mb"
   printf 'Update workers: %s\n' "$update_workers"
-  printf 'Cache: %s MiB; update sleep: %s s; rebuild interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$rebuild_seconds" "$log_level"
+  printf 'Cache: %s MiB; update window: %s s; rebuild interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$rebuild_seconds" "$log_level"
   printf 'Retain all values: %s; keep chunks: %s; verify counts: %s\n' "$all_values" "$keep_chunks" "$verify"
   if [[ $host_ip != 127.0.0.1 ]]; then
     printf 'The host binding is not loopback. Restrict access through your VPN/firewall/TLS proxy; Docker publishing can bypass UFW.\n'
