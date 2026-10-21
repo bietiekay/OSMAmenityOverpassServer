@@ -1,15 +1,19 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fetch as undiciFetch } from 'undici';
-import { main as runExtraction } from '../extract.mjs';
+import { main as runExtraction, sourceMetadata } from '../extract.mjs';
 import { buildIndex } from '../extract/assembly.mjs';
 import { applyDiffBatchGeneration } from './apply-generation.mjs';
 import { activateGeneration, withGenerationLock } from './generation.mjs';
 import { downloadDiff, fetchReplicationState } from './replication.mjs';
+import { downloadCurrentPlanet } from './source-download.mjs';
 
 const MAX_CATCHUP_DIFFS = 100000;
 const MAX_CATCHUP_BYTES = 2 * 1024 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
 export function pipelineRoot(dataDir) {
   const resolved = path.resolve(dataDir);
@@ -26,7 +30,8 @@ function timestampMillis(value) {
   return Number.isFinite(milliseconds) ? milliseconds : null;
 }
 
-export function isReextractDue(state, now = Date.now(), intervalSeconds = 604800) {
+export function isReextractDue(state, now = Date.now(), intervalSeconds = 15552000) {
+  if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds <= 0) return false;
   const last = timestampMillis(state?.lastReextractAt);
   return last !== null && now - last >= intervalSeconds * 1000;
 }
@@ -53,7 +58,27 @@ function sameFileIdentity(left, right) {
   return Object.keys(left).every((key) => left[key] === right[key]);
 }
 
-async function buildCandidate({ pipelineDir, sourcePbf, amenities, shardPrecision, signal, extractOptions = {}, extraction = runExtraction }) {
+async function metadataForReextract(sourcePbf, replication, signal, onLog = () => {}) {
+  const metadata = sourceMetadata(sourcePbf, { allowBootstrap: false });
+  if (timestampMillis(metadata.timestamp) === null) throw new Error('new source PBF has no valid snapshot timestamp');
+  if (metadata.replication && !namespaceMatches(metadata.replication, replication)) {
+    throw new Error('new source PBF declares a different replication namespace');
+  }
+  if (metadata.replication && namespaceMatches(metadata.replication, replication) &&
+      Number.isSafeInteger(metadata.replication.sequenceNumber) && metadata.replication.sequenceNumber > 0) return metadata;
+  if (replication.kind !== 'planet' || replication.interval !== 'minute') {
+    throw new Error('new source PBF has no valid cursor in the configured replication namespace');
+  }
+  onLog('re-extract source: deriving the new planet minute cursor from PBF timestamp');
+  let stdout;
+  try { ({ stdout } = await execFileAsync('pyosmium-get-changes', ['-O', sourcePbf], { encoding: 'utf8', signal })); }
+  catch (error) { throw new Error(`could not derive minute cursor from new planet PBF: ${error.stderr || error.message}`); }
+  const nextSequence = Number(stdout.trim());
+  if (!Number.isSafeInteger(nextSequence) || nextSequence <= 1) throw new Error('pyosmium returned an invalid next replication sequence');
+  return { ...metadata, replication: { ...replication, sequenceNumber: nextSequence - 1 } };
+}
+
+async function buildCandidate({ pipelineDir, sourcePbf, amenities, shardPrecision, metadata, signal, extractOptions = {}, extraction = runExtraction }) {
   const scratch = path.join(pipelineDir, 'work', `reextract-${randomUUID()}`);
   const sourceIdentity = await fileIdentity(sourcePbf);
   await fs.mkdir(scratch, { recursive: true });
@@ -69,6 +94,7 @@ async function buildCandidate({ pipelineDir, sourcePbf, amenities, shardPrecisio
       '--keep-chunks', 'false',
       ...Object.entries(extractOptions).flatMap(([key, value]) => [`--${key}`, String(value)])
     ], {
+      ...(metadata ? { sourceMetadata: () => metadata } : {}),
       buildIndex: async (options) => {
         candidate = await buildIndex({ ...options, publish: false });
         return candidate;
@@ -96,18 +122,24 @@ async function buildCandidate({ pipelineDir, sourcePbf, amenities, shardPrecisio
 export async function runReextract({
   dataDir, sourcePbf, amenities = ['toilets'], shardPrecision = 5, replication,
   signal, fetchImpl = undiciFetch, extraction = runExtraction, maxCatchupDiffs = MAX_CATCHUP_DIFFS,
-  maxCatchupBytes = MAX_CATCHUP_BYTES, now = () => new Date().toISOString()
+  maxCatchupBytes = MAX_CATCHUP_BYTES, now = () => new Date().toISOString(), requireNewSource = false,
+  onLog = () => {}
 }) {
   const pipelineDir = pipelineRoot(dataDir);
   const source = sourcePbf?.trim();
-  if (!source) throw new Error('a PBF path is required for the weekly re-extract');
+  if (!source) throw new Error('a newer PBF path is required for the full re-extract');
   if (!replication?.baseUrl || !['planet', 'regional'].includes(replication.kind) || !['minute', 'day'].includes(replication.interval)) {
-    throw new Error('a complete replication namespace is required for the weekly re-extract');
+    throw new Error('a complete replication namespace is required for the full re-extract');
   }
   await fs.access(source);
   const initial = await readActive(pipelineDir);
   if (!namespaceMatches(initial.state.replication, replication)) throw new Error('configured replication namespace does not match the active generation');
-  const candidate = await buildCandidate({ pipelineDir, sourcePbf: path.resolve(source), amenities, shardPrecision, signal, extraction });
+  if (requireNewSource && path.resolve(source) === initial.state.sourcePbf) throw new Error('scheduled re-extract requires a new immutable source PBF; refusing to rebuild from the active baseline');
+  const metadata = extraction === runExtraction ? await metadataForReextract(path.resolve(source), replication, signal, onLog) : null;
+  if (requireNewSource && metadata && timestampMillis(metadata.timestamp) <= timestampMillis(initial.manifest.sourceTimestamp)) {
+    throw new Error('new source PBF is not newer than the active baseline snapshot');
+  }
+  const candidate = await buildCandidate({ pipelineDir, sourcePbf: path.resolve(source), amenities, shardPrecision, metadata, signal, extraction });
   const candidateDir = candidate.generationDir;
   try {
     const candidateState = JSON.parse(await fs.readFile(path.join(candidateDir, 'state.json'), 'utf8'));
@@ -116,6 +148,10 @@ export async function runReextract({
     if (!namespaceMatches(candidateState.replication, replication)) throw new Error('new PBF replication metadata does not match the configured namespace');
     if (timestampMillis(candidateState.dataTimestamp) === null) throw new Error('new PBF has no valid source timestamp');
     if (!candidateState.sourceFingerprint || candidateState.sourcePbf !== path.resolve(source)) throw new Error('candidate source PBF provenance is incomplete');
+    if (requireNewSource && candidateState.sourceFingerprint === initial.state.sourceFingerprint) throw new Error('new source PBF has the same fingerprint as the active baseline');
+    if (requireNewSource && timestampMillis(candidateState.dataTimestamp) <= timestampMillis(initial.manifest.sourceTimestamp)) {
+      throw new Error('new source PBF is not newer than the active baseline snapshot');
+    }
 
     return await withGenerationLock(pipelineDir, async () => {
       if (signal?.aborted) throw signal.reason ?? new Error('re-extract aborted');
@@ -196,22 +232,39 @@ export async function runReextract({
   }
 }
 
-/** Establish a weekly timer baseline on first startup, then check at each interval. */
+/** Establish a timer baseline on first enabled check, then rebuild when due. */
 export async function maybeRunReextract(options) {
+  const intervalSeconds = options.intervalSeconds ?? 15552000;
+  if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds <= 0) return null;
   const pipelineDir = pipelineRoot(options.dataDir);
   const active = await readActive(pipelineDir);
   const scheduleFile = path.join(pipelineDir, '.reextract-schedule.json');
   const at = options.now?.() ?? new Date().toISOString();
   let schedule;
   try { schedule = JSON.parse(await fs.readFile(scheduleFile, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const lastReextractAt = active.state.lastReextractAt ?? schedule?.lastReextractAt;
-  if (!lastReextractAt) {
-    await writeJsonAtomic(scheduleFile, { lastReextractAt: at });
+  if (!active.state.lastReextractAt && schedule?.intervalSeconds !== intervalSeconds) {
+    await writeJsonAtomic(scheduleFile, { lastReextractAt: at, intervalSeconds });
     return null;
   }
-  const shouldRun = isReextractDue({ lastReextractAt }, Date.parse(at), options.intervalSeconds ?? 604800);
+  const lastReextractAt = active.state.lastReextractAt ?? schedule?.lastReextractAt;
+  if (!lastReextractAt) {
+    await writeJsonAtomic(scheduleFile, { lastReextractAt: at, intervalSeconds });
+    return null;
+  }
+  const shouldRun = isReextractDue({ lastReextractAt }, Date.parse(at), intervalSeconds);
   if (!shouldRun) return null;
-  const result = await runReextract(options);
+  let sourcePbf = options.sourcePbf;
+  if (!sourcePbf) {
+    if (options.replication?.kind !== 'planet' || options.replication?.interval !== 'minute') {
+      throw new Error('regional re-extract requires an explicit newer source PBF');
+    }
+    sourcePbf = await downloadCurrentPlanet(pipelineDir, {
+      url: options.sourceUrl, checksumUrl: options.checksumUrl,
+      signal: options.signal, fetchImpl: options.fetchImpl ?? undiciFetch,
+      onLog: options.onLog
+    });
+  }
+  const result = await runReextract({ ...options, sourcePbf });
   await fs.rm(scheduleFile, { force: true });
   return result;
 }

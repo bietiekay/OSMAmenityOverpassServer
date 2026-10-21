@@ -23,7 +23,8 @@ async function setup(cursor = 1) {
 }
 
 const makeWorker = (root: string, overrides: object = {}) => createUpdateWorker({
-  pipelineDir: root, replication, fetchState: async () => ({ sequenceNumber: 3, timestamp: '2026-10-15T00:00:00Z', originalPlanetSequence: 7329040 }),
+  pipelineDir: root, replication, reextractEnabled: true,
+  fetchState: async () => ({ sequenceNumber: 3, timestamp: '2026-10-15T00:00:00Z', originalPlanetSequence: 7329040 }),
   download: async (_replication: unknown, sequence: number, destination: string) => {
     await fs.mkdir(path.dirname(destination), { recursive: true }); await fs.writeFile(destination, String(sequence));
     return { bytes: 1 };

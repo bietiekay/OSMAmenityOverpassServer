@@ -310,7 +310,7 @@ describe('weekly drift re-extract', () => {
         extraction, now: () => '2026-10-15T00:00:00Z' });
       expect(result).toBeNull(); expect(extraction).not.toHaveBeenCalled();
       expect(JSON.parse(await fs.readFile(path.join(fixture.pipelineDir, '.reextract-schedule.json'), 'utf8')))
-        .toEqual({ lastReextractAt: '2026-10-15T00:00:00Z' });
+        .toEqual({ lastReextractAt: '2026-10-15T00:00:00Z', intervalSeconds: 15552000 });
       await expect(maybeRunReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, replication,
         extraction, now: () => '2026-10-15T00:00:00Z' })).resolves.toBeNull();
       expect(extraction).not.toHaveBeenCalled();
@@ -321,7 +321,7 @@ describe('weekly drift re-extract', () => {
     const fixture = await makeFixture();
     try {
       const schedule = path.join(fixture.pipelineDir, '.reextract-schedule.json');
-      await fs.writeFile(schedule, JSON.stringify({ lastReextractAt: '2026-10-01T00:00:00Z' }));
+      await fs.writeFile(schedule, JSON.stringify({ lastReextractAt: '2026-10-01T00:00:00Z', intervalSeconds: 604800 }));
       const result = await maybeRunReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source,
         replication, amenities: ['toilets'], shardPrecision: 5, extraction: await extractionFor(fixture),
         fetchImpl: fetcher(1, null), now: () => '2026-10-08T00:00:00Z', intervalSeconds: 604800 });

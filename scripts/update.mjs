@@ -96,7 +96,8 @@ export function createUpdateWorker({
   pipelineDir, replication, sourcePbf = null,
   amenities = ['toilets'], shardPrecision = 5, updateIntervalSeconds = 3600,
   generationsToKeep = 2,
-  reextractEverySeconds = 604800, reextractSourcePbf = null,
+  reextractEnabled = false, reextractEverySeconds = 15552000, reextractSourcePbf = null,
+  reextractSourceUrl = undefined, reextractChecksumUrl = undefined,
   fetchImpl = undiciFetch, fetchState = fetchReplicationState, download = downloadDiff,
   apply = applyDiffGeneration, checkReextract = maybeRunReextract,
   onLog = (message) => console.log(message), onError = (error) => console.error(error.stack ?? error),
@@ -215,13 +216,13 @@ export function createUpdateWorker({
       let failed = false;
       try { result = await runOnce(signal, { batchWindowSeconds: checkIntervalSeconds }); }
       catch (error) { failed = true; if (!signal?.aborted) onError(error); }
-      if (!signal?.aborted) {
+      if (!signal?.aborted && reextractEnabled && reextractEverySeconds > 0) {
         try {
-          let rebuildPbf = reextractSourcePbf ?? sourcePbf;
-          if (!rebuildPbf) rebuildPbf = (await readState(root)).state.sourcePbf ?? null;
-          const rebuilt = await checkReextract({ dataDir: root, sourcePbf: rebuildPbf, amenities, shardPrecision,
-            replication, intervalSeconds: reextractEverySeconds, signal });
-          if (rebuilt) onLog(`weekly re-extract activated sequence ${rebuilt.sequenceNumber}`);
+          const rebuilt = await checkReextract({ dataDir: root, sourcePbf: reextractSourcePbf,
+            sourceUrl: reextractSourceUrl, checksumUrl: reextractChecksumUrl,
+            amenities, shardPrecision, replication, intervalSeconds: reextractEverySeconds,
+            signal, onLog, requireNewSource: true });
+          if (rebuilt) onLog(`re-extract activated sequence ${rebuilt.sequenceNumber}`);
           if (rebuilt) await cleanupAfterSuccess(Date.now(), rebuilt.sequenceNumber);
         } catch (error) { if (!signal?.aborted) onError(error); }
       }
@@ -258,9 +259,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const replication = { baseUrl: config.updateBaseUrl, kind: config.updateKind, interval: config.updateGranularity };
   const worker = createUpdateWorker({ pipelineDir, replication, sourcePbf,
     reextractSourcePbf: config.reextractSourcePbf ? path.resolve(config.reextractSourcePbf) : null,
+    reextractSourceUrl: config.reextractSourceUrl ?? undefined,
+    reextractChecksumUrl: config.reextractChecksumUrl ?? undefined,
     amenities: config.amenities, shardPrecision: config.shardPrecision,
     updateIntervalSeconds: config.updateIntervalSeconds, generationsToKeep: config.generationsToKeep,
-    reextractEverySeconds: config.reextractEverySeconds });
+    reextractEnabled: config.reextractEnabled, reextractEverySeconds: config.reextractEverySeconds });
   if (!argv.includes('--watch')) return worker.runOnce();
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('update worker stopping'));

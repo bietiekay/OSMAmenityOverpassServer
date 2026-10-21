@@ -20,6 +20,9 @@ export interface ServerConfig {
   updateGranularity: 'minute' | 'day';
   sourcePbf: string | null;
   reextractSourcePbf: string | null;
+  reextractSourceUrl: string | null;
+  reextractChecksumUrl: string | null;
+  reextractEnabled: boolean;
   reextractEverySeconds: number;
   redisUrl: string | null;
   logVerbosity: 'errors' | 'info' | 'debug';
@@ -47,6 +50,14 @@ const readInt = (
   if (allowed && !allowed.includes(value)) {
     throw new Error(`${name} must be one of [${allowed.join(', ')}], got: ${value}`);
   }
+  return value;
+};
+
+const readNonNegativeInt = (env: Env, name: string, fallback: number): number => {
+  const raw = env[name];
+  if (raw === undefined || raw.trim().length === 0) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a non-negative integer, got: ${raw}`);
   return value;
 };
 
@@ -101,7 +112,10 @@ export const loadConfig = (env: Env = process.env): ServerConfig => {
     updateGranularity: regional ? 'day' : 'minute',
     sourcePbf: env.OSM_AMENITY_SOURCE_PBF?.trim() || null,
     reextractSourcePbf: env.OSM_AMENITY_REEXTRACT_SOURCE_PBF?.trim() || null,
-    reextractEverySeconds: readInt(env, 'OSM_AMENITY_REEXTRACT_EVERY_SECONDS', 604800),
+    reextractSourceUrl: env.OSM_AMENITY_REEXTRACT_SOURCE_URL?.trim() || null,
+    reextractChecksumUrl: env.OSM_AMENITY_REEXTRACT_CHECKSUM_URL?.trim() || null,
+    reextractEnabled: readBool(env, 'OSM_AMENITY_REEXTRACT_ENABLED', false),
+    reextractEverySeconds: readNonNegativeInt(env, 'OSM_AMENITY_REEXTRACT_EVERY_SECONDS', 15552000),
     redisUrl:
       redisUrlRaw && redisUrlRaw.trim().length > 0 ? redisUrlRaw.trim() : null,
     logVerbosity: logVerbosityRaw

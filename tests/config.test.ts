@@ -30,7 +30,8 @@ describe('loadConfig', () => {
     expect(config.updateGranularity).toBe('minute');
     expect(config.sourcePbf).toBeNull();
     expect(config.reextractSourcePbf).toBeNull();
-    expect(config.reextractEverySeconds).toBe(604800);
+    expect(config.reextractEnabled).toBe(false);
+    expect(config.reextractEverySeconds).toBe(15552000);
     expect(config.redisUrl).toBeNull();
     expect(config.logVerbosity).toBe('info');
   });

@@ -105,8 +105,9 @@ The three paths have different jobs:
 - **Pipeline directory** is the main data volume. It contains temporary PBF
   chunks, intermediate extraction and lookup files, the active shard index, and
   may retain old generations during rebuilds. The chunk set is roughly another
-  source-sized copy; intermediate files and the index add more, and rebuilds
-  can temporarily need space alongside the currently active generation.
+  source-sized copy; intermediate files and the index add more, and enabled
+  rebuilds can temporarily need space alongside the current generation and
+  another downloaded planet PBF.
 - **Deployment directory** holds Compose and environment configuration and is
   small compared with the other two.
 
@@ -143,7 +144,7 @@ with checksum verification, source-header validation, detached import, startup,
 HTTP checks, and a proxy integration example. The exact replication URL is read
 from the PBF when available. For the official planet dump, it derives a safe
 minute-feed start sequence with `pyosmium-get-changes`. Initial extraction
-settings do not change the automatic weekly rebuild's resource defaults.
+settings do not change an optional full rebuild's resource defaults.
 
 To generate configuration without downloading or using Docker:
 
@@ -251,7 +252,7 @@ df -i /srv
 
 Plan space for the retained planet PBF, another approximately source-sized set
 of PBF chunks, intermediate extraction files, source lookup indexes, the active
-index, rebuild candidates, and old generations. Weekly rebuilds overlap with
+index, rebuild candidates, and old generations. Enabled rebuilds overlap with
 the active index. **The PBF download size alone is not a disk-space budget.**
 There is no measured planet RAM/disk requirement or import duration yet.
 
@@ -260,7 +261,7 @@ workers. Do not lower the per-worker budget to 1024 MiB for a planet import; a
 worker can exceed that limit and fail. Leave additional host RAM for Docker, the
 OS, the proxy, and Redis.
 Those extraction settings are not a total container memory limit, and do not
-carry over to the automatic weekly rebuild, which uses pipeline defaults.
+carry over to an enabled full rebuild, which uses pipeline defaults.
 Monitor actual usage throughout commissioning.
 
 ## 2. Check out the application and create persistent directories
@@ -330,7 +331,8 @@ OSM_AMENITY_SHARD_PRECISION=5
 OSM_AMENITY_SHARD_CACHE_MB=256
 OSM_AMENITY_UPDATE_INTERVAL_SECONDS=3600
 OSM_AMENITY_GENERATIONS_TO_KEEP=2
-OSM_AMENITY_REEXTRACT_EVERY_SECONDS=604800
+OSM_AMENITY_REEXTRACT_ENABLED=false
+OSM_AMENITY_REEXTRACT_EVERY_SECONDS=15552000
 LOG_VERBOSITY=info
 ENV
 ```
@@ -523,7 +525,7 @@ catch-up may exceed the current batch limits (including 2 GiB of compressed
 diffs, 50,000 affected objects, or 5,000 affected cells). Such a failure does not
 advance the cursor. A shorter sleep interval only reduces future batch sizes;
 it does not split an existing oversized backlog. See
-[operations and current limits](docs/OPERATIONS.md#8-weekly-source-refresh-and-routine-monitoring).
+[operations and current limits](docs/OPERATIONS.md#8-optional-source-refresh-and-routine-monitoring).
 If even the newest published planet cannot catch up within these limits,
 planet replication needs implementation work before this deployment can be
 considered current. Do not bypass the limits by editing `state.json`.
@@ -636,9 +638,13 @@ The geometry member-object cache currently has no aggregate memory cap, and
 updates validate/recount the full shard inventory. Japan results do not
 establish planet memory bounds or sustained update throughput.
 
-Weekly re-extraction is automatic, but downloading a newer PBF is not. The
-first scheduled check initializes the weekly timer rather than immediately
-rebuilding. To supply a newer baseline later:
+Scheduled full rebuilding is disabled by default. Normal replication updates
+continue without it. Set `OSM_AMENITY_REEXTRACT_ENABLED=true` to opt in; the
+default interval is 180 days (`15552000` seconds). The first enabled check
+starts the timer rather than rebuilding immediately. When due on a planet
+deployment, the updater downloads the current planet PBF and matching MD5 into
+the writable pipeline's `source-snapshots/` directory. It never overwrites
+`planet-initial.osm.pbf`. To supply a newer baseline yourself instead:
 
 1. Download it to a **new filename** in `/srv/osm-amenity/sources`, verify its
    checksum and planet/minute header as above, and keep the file immutable.
@@ -647,7 +653,7 @@ rebuilding. To supply a newer baseline later:
    to `/srv/osm-amenity/server.env`, using the real new filename.
 3. Run `dc up -d --force-recreate amenity-server`. This loads the new environment;
    it does not force an immediate rebuild.
-4. Watch for `weekly re-extract activated sequence ...` when the rebuild is due.
+4. Watch for `re-extract activated sequence ...` when the rebuild is due.
    The candidate is built and caught up before publication. Continue retaining
    the original baseline and any snapshot required by active/backup generations.
 

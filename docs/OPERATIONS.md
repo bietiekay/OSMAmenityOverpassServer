@@ -100,7 +100,7 @@ header options `osmosis_replication_base_url`,
 The retained PBF is required after extraction: updates resolve unchanged member
 objects from it. A snapshot with missing timestamp or replication provenance
 can produce an initial index, but cannot establish a safe automatic update or
-weekly-rebuild baseline. Do not invent a cursor or replace missing provenance
+optional-rebuild baseline. Do not invent a cursor or replace missing provenance
 with file mtime/current time.
 
 For the verified October 2026 Japan snapshot the feed is
@@ -219,7 +219,7 @@ reverse proxy to control exposure. There is no built-in authentication or TLS.
 
 The HTTP server starts an updater subprocess automatically after listening.
 There is no configuration switch to disable this worker. It catches up at
-startup, then wakes every 3600 seconds by default, and checks the weekly rebuild
+startup, then wakes every 3600 seconds by default, and checks the optional rebuild
 schedule after each update cycle. HTTP service can remain available while an
 update fails, so an open port is not evidence of current data.
 
@@ -305,15 +305,45 @@ The example environment file uses assignments compatible with both systemd and
 POSIX shell sourcing. If catch-up fails, inspect the error before restarting;
 do not edit a cursor to skip the missing sequence.
 
-## 8. Weekly source refresh and routine monitoring
+## 8. Optional source refresh and routine monitoring
 
-The first scheduled check establishes a persistent weekly timer baseline when
-no successful rebuild time exists. Subsequent checks use 604800 seconds by
-default. The server does **not** download a newer source PBF itself. Download
-and inspect a new, separate immutable file as in step 3, set
-`OSM_AMENITY_REEXTRACT_SOURCE_PBF` to that path in the service environment, and
-restart. This selects the source for the next due rebuild; restart alone does
-not force an immediate rebuild.
+Full rebuilding is disabled by default because contiguous replication updates
+maintain the configured amenity index. Set `OSM_AMENITY_REEXTRACT_ENABLED=true`
+only when periodic replacement from a fresh PBF is desired. The default
+interval when enabled is 180 days (`15552000` seconds). The first enabled check
+establishes a persistent timer baseline when no previous rebuild exists; it
+does not rebuild immediately. A saved legacy timer without this interval is
+reset when the new schedule is enabled. When due, a planet deployment downloads the
+current PBF and matching MD5 to a new immutable file under the writable
+pipeline's `source-snapshots/`. The original baseline is never overwritten.
+Alternatively, provide a newer immutable PBF using
+`OSM_AMENITY_REEXTRACT_SOURCE_PBF`; regional rebuilds require this explicit path.
+Restart loads the configuration but does not itself force a rebuild.
+Existing deployments may still have `OSM_AMENITY_REEXTRACT_EVERY_SECONDS=604800`
+in their saved environment. The new `OSM_AMENITY_REEXTRACT_ENABLED=false` default
+keeps them disabled; set the interval to `15552000` before opting in if a
+roughly six-month schedule is wanted.
+
+For an installation still running the previous image, disable its scheduled
+rebuild immediately by changing `OSM_AMENITY_REEXTRACT_EVERY_SECONDS` in
+`deployment/server.env` to `315360000` (ten years), then recreate the service.
+That image rejects `0` and does not know `OSM_AMENITY_REEXTRACT_ENABLED`.
+After pulling and rebuilding this version, set
+`OSM_AMENITY_REEXTRACT_ENABLED=false` in the same file and recreate again.
+The normal replication updater remains enabled.
+Downloaded source snapshots are retained because a live or rollback generation
+may still refer to them. Check their references before manual removal; the
+generation retention setting does not delete PBF source files.
+The delta overlay stores changes to unselected objects as well: a later toilet
+way or relation can depend on them. Each overlay partition is limited to 8 MiB.
+With rebuilding disabled, monitor the largest partition and refresh from a
+newer baseline before it reaches that limit. A six-month interval is not a
+measured guarantee that the planet overlay stays below the limit.
+
+```bash
+find /var/lib/osm-amenity/japan/data/delta-objects -maxdepth 1 -type f -name '*.jsonl' -printf '%s %p\n' | sort -nr | head
+du -sh /var/lib/osm-amenity/japan/data/delta-objects
+```
 
 A candidate must carry a valid source timestamp and positive cursor in the
 same namespace. It is built separately, caught up to the latest/active cursor,
@@ -327,7 +357,7 @@ Monitor these together:
 - `localEngine.dataTimestamp`, `localEngine.replication.sequenceNumber`, and
   `localEngine.lastUpdate` in `/api/status`; compare with the matching feed's
   `state.txt`, not wall-clock assumptions about a daily feed.
-- Journal messages for catch-up, successful weekly activation, and errors.
+- Journal messages for catch-up, optional rebuild activation, and errors.
 - Free space and inode availability in the pipeline/source filesystems.
 - HTTP error rate, process RSS, extraction/rebuild duration, and proxy fallback.
 
@@ -470,7 +500,7 @@ generation or its source snapshot.
 | Generation transaction already active | Let the other writer finish or stop it cleanly. `flock` releases after process death; the persistent lock filename is not evidence of a stale lock. |
 | `flock` not found | Install `util-linux` and ensure its executable is in the service PATH. |
 | Worker memory/batch limit | Read the specific bound; reduce extraction concurrency or use appropriate RAM/chunks; use a newer baseline for oversized catch-up. |
-| Weekly rebuild has not run | Check persisted schedule/`lastReextractAt`, configured interval, source metadata, logs, and available disk. |
+| Enabled rebuild has not run | Check persisted schedule/`lastReextractAt`, configured interval, source metadata, logs, and available disk. |
 | Public parity fails | Compare source timestamps first; the reference endpoint may be unavailable. No general parity is promised for nested relations or missing metadata. |
 
 ## 11. Optional Docker deployment
@@ -516,7 +546,7 @@ retention checks as for the native service.
 Use a planet PBF with a usable planet/minute header and retain it unchanged.
 Set the exact persisted feed URL in the environment; use the same stages 0–4
 and server APIs. Measure full-source disk/RAM/time, first-update lookup-index
-cost, hourly update throughput, weekly candidate overlap, and backup/retention
+cost, hourly update throughput, optional candidate overlap, and backup/retention
 capacity on the production hardware. Japan measurements do not establish these.
 Add an aggregate bound for the shared update geometry cache before relying on
 the lookup limits as a planet update-memory guarantee. Do not increase budgets

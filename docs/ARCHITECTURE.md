@@ -32,7 +32,7 @@ description of every current implementation choice.
 | `scripts/extract/storage.mjs` | Partitioned disk lookups, bounded caches, external-sort unique counts |
 | `scripts/extract/assembly.mjs` | Stage-4 geometry/helper placement, shard build, guarded activation |
 | `scripts/extract/source-index.mjs` | Retained-PBF block ranges and tracked reference/cell indexes |
-| `scripts/update.mjs` | One-shot catch-up or watch loop, source attestation and weekly scheduling |
+| `scripts/update.mjs` | One-shot catch-up or watch loop, source attestation and optional rebuild scheduling |
 | `scripts/update/replication.mjs` | Namespace-local feed URLs, bounded downloads and gzip streaming |
 | `scripts/update/change-parser.mjs` | Action-aware osmChange streaming with validation |
 | `scripts/update/change-apply.mjs` | Small streamed change-application helper |
@@ -40,7 +40,7 @@ description of every current implementation choice.
 | `scripts/update/object-resolver.mjs` | Resolve current objects from overlay, then retained PBF |
 | `scripts/update/apply-generation.mjs` | Ordered batch replay, dependency closure, affected geometry/shard rebuild |
 | `scripts/update/generation.mjs` | Kernel lock, copy-on-write staging, durability and atomic activation |
-| `scripts/update/reextract.mjs` | Isolated full candidate build, catch-up and weekly publication |
+| `scripts/update/reextract.mjs` | Isolated full candidate build, catch-up and optional publication |
 | `scripts/verify-http.mjs` | Live local HTTP contract verifier |
 | `scripts/parity.mjs` | Explicit two-endpoint element comparison for a supplied query |
 | `scripts/make-fixture.mjs` | Deterministic native extraction fixture |
@@ -105,6 +105,7 @@ pipeline/
   .reextract-schedule.json          first-check timer baseline, when needed
   work/                            chunk/stage manifests, records, temporary diffs
   update-cache/                    source block indexes and source attestations
+  source-snapshots/                immutable downloaded PBFs for enabled planet rebuilds
   data -> data-generations/<id>     active relative symlink
   data-generations/<id>/
     manifest.json                  inventory, config/source fingerprint, counts
@@ -183,7 +184,7 @@ orphan helpers, appends conservative reverse edges and recalculates exact typed
 counts with external sorting. Old edges may cause extra work but do not suppress
 new dependencies. Source data and cursor metadata advance together.
 
-## Publication, crash recovery, and weekly rebuilds
+## Publication, crash recovery, and optional rebuilds
 
 A stable `.generation.lock` inode is locked through Linux `flock`. The parent
 retains the inherited locked open-file description; normal close, process exit,
@@ -197,14 +198,16 @@ replaces the old link. Parent directories are synced. Cleanup never deletes a
 generation that has already become active, including a post-switch sync error.
 Queries pinned to older generations can finish because those directories remain.
 
-The weekly job builds stages 0–4 in isolation with `publish:false`, verifies its
+The opt-in full rebuild builds stages 0–4 in isolation with `publish:false`, verifies its
 source identity/provenance, then locks and rereads the active cursor. It replays
 the candidate through the active/latest cursor and activates once. Snapshot
 source, namespace and cursor checks prevent regressions. A zero-diff planet
 candidate still receives its global cursor; a regional candidate keeps
 `lastSeq:0`. Later update cycles resolve the newly active source, including after
 restart with an older configured override. The first scheduling check establishes
-a timer baseline; the worker does not download new PBF snapshots itself.
+a timer baseline; when enabled and due, the worker downloads a checksummed
+current planet PBF into a new immutable pipeline source file unless a separate
+newer PBF was configured.
 
 SIGINT/SIGTERM cancel watch sleep/network work and stop native extraction
 children. Server shutdown closes HTTP and its updater, escalating to SIGKILL
@@ -235,7 +238,7 @@ The test suites cover parser/output contracts, same-ID different-type records,
 CRC/layout corruption, real HTTP requests, native fixture pipelines, cross-chunk
 references, high node IDs, markers/resume, partition budgets, RSS supervision,
 source drift, action/version guards, geometry dependencies and helper sharing,
-transaction failure/retry, SIGKILL lock recovery, worker lifecycle and weekly
+transaction failure/retry, SIGKILL lock recovery, worker lifecycle and optional
 candidate catch-up/source rotation. `npm run verify` runs lint/build/tests;
 `npm run test:ci` enforces 90% statements/functions/lines and 85% branches across
 productive server, extraction and updater modules.

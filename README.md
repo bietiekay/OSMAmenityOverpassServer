@@ -58,9 +58,12 @@ requests instead of returning a misleading empty success.
 | `OSM_AMENITY_GENERATIONS_TO_KEEP` | `2` | Minimum number of published generations to retain, including the active one (minimum 2); older ones are deleted after a one-hour grace period |
 | `OSM_AMENITY_UPDATE_WORKERS` | `1` | Concurrent update lookup and geometry tasks (1–16) |
 | `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Replication namespace root; Geofabrik host implies regional/day, otherwise planet/minute |
-| `OSM_AMENITY_SOURCE_PBF` | unset | Optional retained PBF path for updater re-extract; mounted path can differ from the source path recorded at build |
-| `OSM_AMENITY_REEXTRACT_SOURCE_PBF` | unset | Optional PBF used only for weekly drift re-extracts; falls back to `OSM_AMENITY_SOURCE_PBF` |
-| `OSM_AMENITY_REEXTRACT_EVERY_SECONDS` | `604800` | Drift-guard interval (one week by default) |
+| `OSM_AMENITY_SOURCE_PBF` | unset | Optional override for the active generation's retained baseline PBF; its fingerprint must match the active generation |
+| `OSM_AMENITY_REEXTRACT_SOURCE_PBF` | unset | Optional newer immutable PBF for an enabled full rebuild; otherwise the current planet is downloaded |
+| `OSM_AMENITY_REEXTRACT_ENABLED` | `false` | Opt in to periodic full rebuilding from a newer PBF; routine replication updates continue while disabled |
+| `OSM_AMENITY_REEXTRACT_EVERY_SECONDS` | `15552000` | Rebuild interval when enabled: 180 days (about six months); `0` also disables it |
+| `OSM_AMENITY_REEXTRACT_SOURCE_URL` | official latest planet PBF | HTTPS source for an enabled planet rebuild when no explicit PBF path is set |
+| `OSM_AMENITY_REEXTRACT_CHECKSUM_URL` | source URL + `.md5` | Matching checksum URL for the automatic planet download |
 | `OSM_AMENITY_REDIS_URL` | unset | Reserved setting; direct proxy Redis invalidation is not implemented |
 | `OSM_AMENITY_REDIS_INVALIDATE` | `false` | Reserved Redis invalidation toggle; only read when Redis is configured |
 | `LOG_VERBOSITY` | `info` | `errors`, `info`, or `debug` |
@@ -142,19 +145,29 @@ exits nonzero; public endpoint availability is not guaranteed.
 ## Replication and current limits
 
 The updater reads a namespace-local replication cursor and applies contiguous
-minute/day diffs through immutable generations. Weekly drift rebuilds run stages
-0–4 into an inactive generation, reject unknown or mismatched snapshot cursors,
-replay the configured namespace through the current live cursor under the
-generation lock, then activate atomically. If no successful re-extract time is
-recorded yet, the first scheduled check establishes the weekly timer baseline
-instead of rebuilding immediately. A separate
-`OSM_AMENITY_REEXTRACT_SOURCE_PBF` may provide a newer source snapshot; when it
-is unset, the updater reuses `OSM_AMENITY_SOURCE_PBF`, then the active
-generation's recorded source path. The update watch loop
-checks the weekly schedule after each catch-up cycle. These mechanisms still
+minute/day diffs through immutable generations. A periodic full rebuild is
+optional and disabled by default: the narrow amenity index does not require it
+for normal sequential updates. The delta overlay retains changes to otherwise
+uninteresting OSM objects because a future toilet way or relation may refer to
+them. A rebuild from a newer snapshot resets that accumulated overlay and can
+recover from some past updater drift; it is a costly maintenance operation,
+not a prerequisite for each update. Delta partitions have an 8 MiB limit, so
+an indefinitely disabled rebuild still needs overlay-size monitoring and an
+eventual fresh baseline if that limit approaches. When enabled, its default
+interval is 180 days; this is a scheduling choice, not a proven planet-wide
+upper bound for overlay growth.
+The first scheduled check establishes a timer baseline instead of rebuilding
+immediately. A separate `OSM_AMENITY_REEXTRACT_SOURCE_PBF` selects a newer,
+immutable source snapshot. Without it, a current planet PBF and matching MD5
+are downloaded into `source-snapshots/` under the writable pipeline root; the
+active baseline is never overwritten. Regional rebuilds require an explicit
+newer PBF. A candidate is built in isolation, caught up to the live cursor,
+validated, and activated atomically. These mechanisms still
 do not prove public Overpass parity, crash recovery in every failure mode, or
 planet-scale resource bounds. Regional Geofabrik inputs use their own daily
 namespace and sequence.
+Downloaded source PBFs remain in `source-snapshots/` until an operator verifies
+that no active, retained, or backup generation needs them.
 
 The watch loop collects small near-head batches until the configured update
 interval has elapsed since the last publication, or until the pending diff

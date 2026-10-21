@@ -36,17 +36,17 @@ export async function sourceFingerprint(file) {
   for await (const chunk of createReadStream(file)) h.update(chunk);
   return h.digest('hex');
 }
-export function sourceMetadata(file) {
+export function sourceMetadata(file, { allowBootstrap = true } = {}) {
   const res = spawnSync('osmium', ['fileinfo', '--json', file], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
   if (res.status !== 0) throw new Error(`osmium fileinfo failed: ${res.stderr}`);
-  return sourceMetadataFromHeader(JSON.parse(res.stdout).header);
+  return sourceMetadataFromHeader(JSON.parse(res.stdout).header, { allowBootstrap });
 }
-export function sourceMetadataFromHeader(header) {
+export function sourceMetadataFromHeader(header, { allowBootstrap = true } = {}) {
   const options = header.option ?? {};
-  // Bootstrap overrides are passed only to the initial extraction. Weekly
+  // Bootstrap overrides are passed only to the initial extraction. Periodic
   // re-extractions must use metadata belonging to their own candidate PBF.
-  const baseUrl = options.osmosis_replication_base_url ?? process.env.OSM_AMENITY_BOOTSTRAP_REPLICATION_BASE_URL;
-  const sequenceNumber = Number(options.osmosis_replication_sequence_number ?? process.env.OSM_AMENITY_BOOTSTRAP_REPLICATION_SEQUENCE_NUMBER);
+  const baseUrl = options.osmosis_replication_base_url ?? (allowBootstrap ? process.env.OSM_AMENITY_BOOTSTRAP_REPLICATION_BASE_URL : undefined);
+  const sequenceNumber = Number(options.osmosis_replication_sequence_number ?? (allowBootstrap ? process.env.OSM_AMENITY_BOOTSTRAP_REPLICATION_SEQUENCE_NUMBER : undefined));
   const intervalFromUrl = (url) => /(?:^|\/)(minute|hour|day)(?:\/|$)/i.exec(url)?.[1]?.toLowerCase();
   const intervalFromTimestamp = (url) => /-updates(?:\/|$)/i.test(url) ? 'day' : undefined;
   return {

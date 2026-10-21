@@ -62,7 +62,7 @@ export const main = async (dependencies: MainDependencies = {}): Promise<void> =
     try { await app.close(); } catch (closeError) { logger.error({ err: closeError }, 'server cleanup after updater start failure failed'); }
     throw error;
   }
-  logger.info({ updateBaseUrl: config.updateBaseUrl, updateKind: config.updateKind, updateGranularity: config.updateGranularity, sourcePbfOverride: config.sourcePbf !== null }, 'OSM updater started');
+  logger.info({ updateBaseUrl: config.updateBaseUrl, updateKind: config.updateKind, updateGranularity: config.updateGranularity, sourcePbfOverride: config.sourcePbf !== null, reextractEnabled: config.reextractEnabled, reextractEverySeconds: config.reextractEverySeconds }, 'OSM updater started');
 
   const signalTarget = dependencies.signalTarget ?? process;
   let closing = false;

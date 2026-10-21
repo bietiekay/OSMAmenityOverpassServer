@@ -18,6 +18,7 @@ const config = (dataDir = '/srv/osm/data'): ServerConfig => ({
   port: 8080, dataDir, amenities: ['toilets'], shardPrecision: 5, shardCacheMb: 128,
   updateIntervalSeconds: 3600, updateBaseUrl: 'https://planet.openstreetmap.org/replication',
   updateKind: 'planet', updateGranularity: 'minute', sourcePbf: null, reextractSourcePbf: null,
+  reextractSourceUrl: null, reextractChecksumUrl: null, reextractEnabled: false,
   reextractEverySeconds: 86400, redisUrl: null, logVerbosity: 'errors'
 });
 function logger() {

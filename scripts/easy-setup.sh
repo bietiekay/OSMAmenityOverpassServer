@@ -100,7 +100,7 @@ repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # Store plain tab-separated values, never executable shell configuration.
 keys=(repository deployment pipeline sources source_file source_mode source_url checksum_url
   project service network dns_name host_ip host_port proxy_mode proxy_service proxy_url fallbacks
-  amenities precision cache_mb update_seconds generations_to_keep rebuild_seconds log_level chunk_mb ram_mb worker_mb
+  amenities precision cache_mb update_seconds generations_to_keep rebuild_enabled rebuild_seconds log_level chunk_mb ram_mb worker_mb
   workers update_workers all_values keep_chunks verify)
 validate_settings() {
   local key value other
@@ -128,7 +128,7 @@ validate_settings() {
   (( host_port <= 65535 && precision >= 3 && precision <= 7 )) || fail 'Invalid port or shard precision.'
   (( worker_mb >= 2048 )) || fail 'Planet imports need at least 2048 MiB per worker; 1024 MiB is insufficient.'
   (( ram_mb >= worker_mb + 512 && workers * worker_mb + 512 <= ram_mb )) || fail 'RAM budget must cover all workers plus a 512 MiB controller reserve.'
-  for key in all_values keep_chunks verify; do
+  for key in all_values keep_chunks verify rebuild_enabled; do
     [[ ${!key} == true || ${!key} == false ]] || fail "Invalid boolean in $key."
   done
   for key in deployment pipeline sources; do
@@ -157,6 +157,7 @@ if [[ $resume == true ]]; then
   done < "$deployment/settings.tsv"
   if [[ ! -v loaded[update_workers] ]]; then update_workers=1; loaded[update_workers]=1; fi
   if [[ ! -v loaded[generations_to_keep] ]]; then generations_to_keep=2; loaded[generations_to_keep]=1; fi
+  if [[ ! -v loaded[rebuild_enabled] ]]; then rebuild_enabled=false; loaded[rebuild_enabled]=1; fi
   for key in "${keys[@]}"; do [[ -v loaded[$key] ]] || fail "Missing saved setting: $key"; done
   [[ $deployment == "$requested_deployment" ]] || fail 'Saved deployment location differs from --resume.'
   validate_settings
@@ -244,14 +245,16 @@ else
   printf 'Published generations are snapshots for serving and rollback. Keep at least the active generation and one predecessor.\n'
   printf 'Older generations are removed after a one-hour grace period; backups must be kept separately.\n'
   ask_int generations_to_keep 'Published generations to retain (default 2)' 2 2 1000
-  ask_int rebuild_seconds 'Weekly drift rebuild interval (seconds)' 604800 1 31536000
+  printf 'A full re-extract scans a new planet PBF and needs substantial disk, RAM and time. Routine replication updates work without it.\n'
+  rebuild_enabled=false; confirm 'Enable scheduled full rebuilds? (downloads a newer planet PBF when due)' no && rebuild_enabled=true
+  ask_int rebuild_seconds 'Full rebuild interval when enabled (seconds; 180 days = 15552000)' 15552000 1 315360000
   while true; do
     ask log_level 'Log verbosity: errors, info, debug' info
     [[ $log_level == errors || $log_level == info || $log_level == debug ]] && break
   done
 
   printf '\nStep 4/5: Initial extraction resources\n'
-  printf 'Leave RAM for the OS, Docker and the proxy. These budgets do not limit the whole container or future weekly rebuilds.\n'
+  printf 'Leave RAM for the OS, Docker and the proxy. These budgets do not limit the whole container or an enabled full rebuild.\n'
   printf 'For a full-planet import, 1024 MiB per worker is insufficient in practice; use at least 2048 MiB per worker.\n'
   printf 'The total pipeline budget must cover workers x per-worker RAM plus a 512 MiB controller reserve.\n'
   ask_int chunk_mb 'PBF chunk size (MiB)' 256 1 1048576
@@ -281,7 +284,7 @@ else
   printf 'Proxy upstream: %s\nFallbacks: %s\nAmenities: %s; precision: %s\n' "$proxy_url" "${fallbacks:-none}" "$amenities" "$precision"
   printf 'Import: %s MiB RAM, %s workers x %s MiB; chunks %s MiB\n' "$ram_mb" "$workers" "$worker_mb" "$chunk_mb"
   printf 'Update workers: %s\n' "$update_workers"
-  printf 'Cache: %s MiB; update window: %s s; generations kept: %s; rebuild interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$generations_to_keep" "$rebuild_seconds" "$log_level"
+  printf 'Cache: %s MiB; update window: %s s; generations kept: %s; rebuild enabled: %s; interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$generations_to_keep" "$rebuild_enabled" "$rebuild_seconds" "$log_level"
   printf 'Retain all values: %s; keep chunks: %s; verify counts: %s\n' "$all_values" "$keep_chunks" "$verify"
   if [[ $host_ip != 127.0.0.1 ]]; then
     printf 'The host binding is not loopback. Restrict access through your VPN/firewall/TLS proxy; Docker publishing can bypass UFW.\n'
@@ -299,6 +302,7 @@ OSM_AMENITY_SHARD_CACHE_MB=$cache_mb
 OSM_AMENITY_UPDATE_INTERVAL_SECONDS=$update_seconds
 OSM_AMENITY_GENERATIONS_TO_KEEP=$generations_to_keep
 OSM_AMENITY_UPDATE_WORKERS=$update_workers
+OSM_AMENITY_REEXTRACT_ENABLED=$rebuild_enabled
 OSM_AMENITY_REEXTRACT_EVERY_SECONDS=$rebuild_seconds
 LOG_VERBOSITY=$log_level
 ENV
