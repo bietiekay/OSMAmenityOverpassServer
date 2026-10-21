@@ -10,3 +10,6 @@ work/
 fixtures/
 *.pbf
 *.osc.gz
+build.sh
+start.sh
+stop.sh
