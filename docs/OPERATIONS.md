@@ -11,7 +11,7 @@ For measured results and outstanding external checks see
 
 ## 1. Prerequisites and filesystem layout
 
-Use Linux with Node.js 22 and npm. The local acceptance used Node 22.23.3 and
+Use Linux with Node.js 26.12.1 or later and npm. The local acceptance used Node 22.23.3 and
 osmium-tool 1.14.0. Install the native dependencies on Debian/Ubuntu:
 
 ```bash
@@ -23,7 +23,7 @@ osmium --version
 command -v sort awk flock
 ```
 
-Node.js and npm must already be installed using your host's Node 22 installation
+Node.js and npm must already be installed using your host's Node 26 installation
 method. Redis is not required by this server; the separate Overpass-Proxy may
 use Redis. Direct Redis invalidation by this server is reserved, not implemented.
 

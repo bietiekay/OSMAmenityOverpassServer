@@ -1,7 +1,6 @@
 import js from '@eslint/js';
 import tseslint from '@typescript-eslint/eslint-plugin';
 import tsParser from '@typescript-eslint/parser';
-import pluginImport from 'eslint-plugin-import';
 import globals from 'globals';
 
 export default [
@@ -22,8 +21,7 @@ export default [
       }
     },
     plugins: {
-      '@typescript-eslint': tseslint,
-      import: pluginImport
+      '@typescript-eslint': tseslint
     },
     rules: {
       'no-unused-vars': 'off',

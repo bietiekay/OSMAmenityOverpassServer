@@ -28,6 +28,10 @@ the acceptance report are external artifacts, not repository contents.
 
 ## Run the server
 
+Use Node.js 26.12.1 or later (`nvm use` selects the version in `.nvmrc`).
+TypeScript is pinned to 6.0.3, the latest stable release supported by the
+TypeScript ESLint parser (currently TypeScript <6.1).
+
 ```bash
 npm ci
 npm run build
@@ -265,7 +269,7 @@ the next batch should start immediately or wait for the configured window.
 
 ## Docker packaging
 
-The runner uses `node:22-bookworm-slim` and installs Debian's `osmium-tool`,
+The runner uses `node:26.12.1-bookworm-slim` and installs Debian's `osmium-tool`,
 `coreutils`, `util-linux` (for `flock`), and `gawk` because the update/re-extract pipeline runs offline
 inside the container. The prior Alpine runtime did not include an available
 `osmium-tool` package. The pipeline root is a writable `/osm` volume; the active

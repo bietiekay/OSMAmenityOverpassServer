@@ -27,7 +27,7 @@ function answers(w: Workspace, changes: Record<string, string> = {}) {
     source: path.join(w.sources, 'planet.osm.pbf'),
     project: 'test-planet', service: 'amenity-test', network: 'test-overpass', alias: 'test-amenity',
     hostIp: '', hostPort: '9091', proxyMode: '', proxyService: '', fallbacks: 'none',
-    amenities: 'toilets,drinking_water', precision: '6', cache: '512', update: '300', rebuild: '', log: '',
+    amenities: 'toilets,drinking_water', precision: '6', cache: '512', update: '300', generations: '', rebuildEnabled: '', rebuild: '', log: '',
     chunk: '128', ram: '6144', worker: '2048', workers: '2', updateWorkers: '3', allValues: '', keepChunks: '', verify: '', write: ''
   };
   return Object.entries(fields).map(([key, value]) => changes[key] ?? value).join('\n') + '\n';

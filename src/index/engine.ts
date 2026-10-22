@@ -277,7 +277,7 @@ export class AmenityEngine {
       try {
         shard = readShard(buffer);
       } catch (error) {
-        throw new Error(`shard ${cell} is corrupt: ${String(error)}`);
+        throw new Error(`shard ${cell} is corrupt: ${String(error)}`, { cause: error });
       }
       if ((this.expectedConfigHash && shard.header.configHash !== this.expectedConfigHash) ||
         (generation.configHash && shard.header.configHash !== generation.configHash)) {
@@ -411,7 +411,7 @@ export class AmenityEngine {
       try { return JSON.parse(await fs.readFile(path.join(dataRoot, name), 'utf8')) as unknown; }
       catch (error) {
         if ((error as { code?: string }).code === 'ENOENT') return null;
-        throw new Error(`generation metadata ${name} is unreadable: ${String(error)}`);
+        throw new Error(`generation metadata ${name} is unreadable: ${String(error)}`, { cause: error });
       }
     };
     const [stateRaw, manifestRaw] = await Promise.all([read('state.json'), read('manifest.json')]);
@@ -480,7 +480,7 @@ export class AmenityEngine {
       return buffer;
     } catch (error) {
       if ((error as { code?: string }).code === 'ENOENT') {
-        if (declaredShards?.has(cell)) throw new Error(`declared shard is missing: ${cell}`);
+        if (declaredShards?.has(cell)) throw new Error(`declared shard is missing: ${cell}`, { cause: error });
         return undefined;
       }
       throw error;

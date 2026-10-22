@@ -380,7 +380,7 @@ dc config
 dc build
 ```
 
-The image includes Node.js 22, osmium, and PyOsmium's replication helper. Only port 8081 on the host's loopback
+The image includes Node.js 26.12.1, osmium, and PyOsmium's replication helper. Only port 8081 on the host's loopback
 address is published. Requests from the proxy containers use the shared network.
 The containers currently run as root, so the bind-mounted pipeline will contain
 root-owned files.
