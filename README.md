@@ -8,6 +8,7 @@ and has been exercised with Japan data; a planet-scale run is not claimed here.
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md): unreleased fixes and release history.
 - [Easy planet setup with Docker Compose](easy-setup.md): step-by-step root-server
   deployment, an interactive [setup wizard](scripts/easy-setup.sh), initial planet
   import, and Overpass-Proxy integration without systemd.

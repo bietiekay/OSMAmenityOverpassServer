@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { finished } from 'node:stream/promises';
-import readline from 'node:readline';
+import { readLfLines } from '../read-lines.mjs';
 import { parseOsmChange } from './change-parser.mjs';
 import { openDiffXml } from './replication.mjs';
 import { sortWithProgress } from './progress-sort.mjs';
@@ -40,7 +40,8 @@ export async function coalesceDiffFiles(diffFiles, workDir, { signal, onProgress
         const key = `${change.type}:${change.id}`;
         const bucket = String(deltaPartitionForKey(key)).padStart(5, '0');
         const orderedKey = `${change.type}:${String(change.id).padStart(16, '0')}`;
-        const row = `${bucket}\t${orderedKey}\t${String(fileIndex).padStart(6, '0')}\t${String(objectIndex).padStart(16, '0')}\t${JSON.stringify(change)}\n`;
+        const payload = Buffer.from(JSON.stringify(change), 'utf8').toString('base64');
+        const row = `${bucket}\t${orderedKey}\t${String(fileIndex).padStart(6, '0')}\t${String(objectIndex).padStart(16, '0')}\t${payload}\n`;
         spoolBytes += Buffer.byteLength(row);
         if (spoolBytes > maxSpoolBytes) throw new Error(`coalesced diff spool exceeds ${maxSpoolBytes} bytes; reduce the replication gap or use a newer baseline`);
         await writeLine(rawStream, row);
@@ -63,7 +64,7 @@ export async function coalesceDiffFiles(diffFiles, workDir, { signal, onProgress
     });
     await fs.rm(raw, { force: true });
 
-    const sortedLines = readline.createInterface({ input: createReadStream(sorted), crlfDelay: Infinity });
+    const sortedLines = readLfLines(createReadStream(sorted));
     const output = createWriteStream(unique, { flags: 'wx' });
     let currentKey = null;
     let currentObject = null;
@@ -78,7 +79,7 @@ export async function coalesceDiffFiles(diffFiles, workDir, { signal, onProgress
         const second = line.indexOf('\t', first + 1);
         const third = line.indexOf('\t', second + 1);
         const fourth = line.indexOf('\t', third + 1);
-        if (first < 0 || second < 0 || third < 0 || fourth < 0) throw new Error('invalid sorted diff spool row');
+        if (first < 0 || second < 0 || third < 0 || fourth < 0) throw new Error('invalid sorted diff spool row ' + (sortedCount + 1) + ': ' + JSON.stringify(line.slice(0, 1000)));
         const bucket = line.slice(0, first);
         const key = line.slice(0, second);
         const object = line.slice(fourth + 1);

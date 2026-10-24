@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import readline from 'node:readline';
+import { readLfLines } from '../read-lines.mjs';
 import { randomUUID } from 'node:crypto';
 
 // Hash partitioned JSONL lookup. A caller only materializes one small partition
@@ -51,7 +51,7 @@ export async function createPartitionedLookup(root, name, records, { partitions 
     if (depth >= 8) throw new Error(`Lookup partition ${stem} remains ${size} bytes after eight splits (limit ${maxPartitionBytes})`);
     const childHandles = new Map();
     try {
-      const rows = readline.createInterface({ input: (await import('node:fs')).createReadStream(file), crlfDelay: Infinity });
+      const rows = readLfLines((await import('node:fs')).createReadStream(file));
       for await (const line of rows) {
         const row = JSON.parse(line); const child = routeHash(row.key, depth) & 1; const childStem = `${stem}.${child}`;
         let h = childHandles.get(childStem);
@@ -93,7 +93,7 @@ export class PartitionedLookup {
       try {
         const { size } = await fs.stat(file); bytes = size;
         if (size > this.maxPartitionBytes) throw new Error(`Lookup partition ${file} is ${size} bytes; hard limit is ${this.maxPartitionBytes}`);
-        const lines = readline.createInterface({ input: (await import('node:fs')).createReadStream(file), crlfDelay: Infinity });
+        const lines = readLfLines((await import('node:fs')).createReadStream(file));
         for await (const line of lines) { const row = JSON.parse(line); values.set(row.key, row.value); }
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
       const estimate = Math.max(bytes * 5, values.size * 128);
@@ -113,7 +113,7 @@ export class PartitionedLookup {
 export async function* readLines(files) {
   for (const file of files) {
     const stream = (await import('node:fs')).createReadStream(file);
-    const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const lines = readLfLines(stream);
     for await (const line of lines) if (line) yield line;
   }
 }
@@ -136,7 +136,7 @@ export async function countUniqueRecords(root, records, partitions = 4096) {
     const file = path.join(dir, name); const { size } = await fs.stat(file);
     if (size > 16 * 1024 * 1024) throw new Error(`Unique-count partition ${name} exceeds 16 MiB`);
     const seen = new Map();
-    const lines = readline.createInterface({ input: (await import('node:fs')).createReadStream(file), crlfDelay: Infinity });
+    const lines = readLfLines((await import('node:fs')).createReadStream(file));
     for await (const line of lines) { const row = JSON.parse(line); if (row.main) seen.set(row.key, true); else if (!seen.has(row.key)) seen.set(row.key, false); }
     for (const isMain of seen.values()) { if (isMain) main++; else support++; }
   }
@@ -167,7 +167,7 @@ export async function createPartitionedMultiIndex(root, name, records, { partiti
   // once, with a hard per-partition read budget and only one partition in RAM.
   for (const bucket of bucketBytes.keys()) {
     const file = path.join(dir, `${bucket}.jsonl`); const unique = new Map();
-    const lines = readline.createInterface({ input: (await import('node:fs')).createReadStream(file), crlfDelay: Infinity });
+    const lines = readLfLines((await import('node:fs')).createReadStream(file));
     for await (const line of lines) {
       const row = JSON.parse(line); let values = unique.get(row.key);
       if (!values) { values = new Set(); unique.set(row.key, values); }
@@ -190,7 +190,7 @@ export function openPartitionedMultiIndex(dir, partitions = 4096, maxPartitionBy
         map = new Map(); const file = path.join(dir, `${bucket}.jsonl`);
         try {
           const { size } = await fs.stat(file); if (size > maxPartitionBytes) throw new Error(`reverse-index partition ${file} exceeds ${maxPartitionBytes} bytes`);
-          const lines = readline.createInterface({ input: (await import('node:fs')).createReadStream(file), crlfDelay: Infinity });
+          const lines = readLfLines((await import('node:fs')).createReadStream(file));
           for await (const line of lines) { const row = JSON.parse(line); let values = map.get(row.key); if (!values) { values = []; map.set(row.key, values); } values.push(row.value); }
         } catch (e) { if (e.code !== 'ENOENT') throw e; }
         cache.set(bucket, map); if (cache.size > 1) cache.delete(cache.keys().next().value);

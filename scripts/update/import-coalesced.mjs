@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createReadStream } from 'node:fs';
-import readline from 'node:readline';
+import { readLfLines } from '../read-lines.mjs';
 
 const FILTER_BYTES = 64 * 1024 * 1024;
 const MAX_RELEVANT_BYTES = 128 * 1024 * 1024;
@@ -35,7 +35,7 @@ async function buildTrackedFilter(indexes, signal, onProgress) {
   onProgress({ phase: 'filtering tracked update keys', completed: 0, total: files.length, unit: 'index files' });
   for (let i = 0; i < files.length; i += 1) {
     checkAborted(signal);
-    const lines = readline.createInterface({ input: createReadStream(files[i]), crlfDelay: Infinity });
+    const lines = readLfLines(createReadStream(files[i]));
     for await (const line of lines) filter.add(JSON.parse(line).key);
     onProgress({ phase: 'filtering tracked update keys', completed: i + 1, total: files.length, unit: 'index files' });
   }
@@ -50,14 +50,14 @@ export async function prepareCoalescedImport(coalesced, indexes, amenities, {
   const relevant = [];
   let completed = 0; let relevantBytes = 0;
   onProgress({ phase: 'identifying affected changes', completed, total: coalesced.uniqueCount, unit: 'objects' });
-  const lines = readline.createInterface({ input: createReadStream(coalesced.file), crlfDelay: Infinity });
+  const lines = readLfLines(createReadStream(coalesced.file));
   for await (const line of lines) {
     checkAborted(signal);
     const divider = line.indexOf('\t');
     if (divider < 1) throw new Error('invalid coalesced delta partition row');
     const size = Buffer.byteLength(line) - divider - 1;
     if (size > maxObjectBytes) throw new Error('coalesced change exceeds update object byte limit');
-    const change = JSON.parse(line.slice(divider + 1));
+    const change = JSON.parse(Buffer.from(line.slice(divider + 1), 'base64').toString('utf8'));
     const key = identity(change);
     const configuredMain = amenities.includes(change.tags?.amenity);
     if (configuredMain || filter.mightContain(key)) {
@@ -86,7 +86,7 @@ async function settledWave(tasks) {
 
 /** Apply each independent partition once; workers never write the same file. */
 export async function importCoalescedPartitions(store, file, total, { workers = 1, signal, onProgress = () => {} } = {}) {
-  const lines = readline.createInterface({ input: createReadStream(file), crlfDelay: Infinity });
+  const lines = readLfLines(createReadStream(file));
   const wave = [];
   let bucket = null; let changes = []; let groupBytes = 0; let completed = 0; let applied = 0;
   const flushWave = async () => {
@@ -118,7 +118,7 @@ export async function importCoalescedPartitions(store, file, total, { workers = 
     bucket = nextBucket;
     groupBytes += Buffer.byteLength(line);
     if (groupBytes > store.maxPartitionBytes * 2) throw new Error(`grouped delta partition ${bucket} exceeds the import memory limit`);
-    changes.push(JSON.parse(line.slice(divider + 1)));
+    changes.push(JSON.parse(Buffer.from(line.slice(divider + 1), 'base64').toString('utf8')));
   }
   await queueGroup();
   await flushWave();

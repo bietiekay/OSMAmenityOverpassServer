@@ -1,10 +1,10 @@
-import fs from 'node:fs'; import path from 'node:path'; import { createHash } from 'node:crypto'; import readline from 'node:readline';
+import fs from 'node:fs'; import path from 'node:path'; import { createHash } from 'node:crypto'; import { readLfLines } from '../read-lines.mjs';
 import { parseOsmElements } from './xml.mjs'; import { encodeElement, encodeId } from './lines.mjs'; import { run, runPipeline, pool, registerChild } from './process.mjs';
 import { createProgress } from './progress.mjs';
 
 const hash = (s) => createHash('sha256').update(s).digest('hex');
 async function fileHash(file) { const h = createHash('sha256'); for await (const b of fs.createReadStream(file)) h.update(b); return h.digest('hex'); }
-async function* readLines(file) { const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity }); for await (const line of rl) if (line) yield line; }
+async function* readLines(file) { for await (const line of readLfLines(fs.createReadStream(file))) if (line) yield line; }
 const files = (dir, re) => fs.readdirSync(dir).filter(x => re.test(x)).sort().map(x => path.join(dir, x));
 async function xmlToLines(source, outfile, select) {
   const tmp = `${outfile}.tmp-${process.pid}`; fs.mkdirSync(path.dirname(outfile), { recursive: true }); const out = fs.createWriteStream(tmp);

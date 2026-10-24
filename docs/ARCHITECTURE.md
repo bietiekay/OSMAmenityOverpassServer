@@ -29,6 +29,7 @@ description of every current implementation choice.
 | `scripts/extract/worker.mjs` | Separate stage-1 parser/filter worker process |
 | `scripts/extract/process.mjs` | Native command pipelines, concurrency, process-tree RSS and cancellation |
 | `scripts/extract/xml.mjs`, `lines.mjs` | Streaming XML and intermediate record codec |
+| `scripts/read-lines.mjs` | LF-only framing for newline-delimited files; preserves Unicode line separators as data |
 | `scripts/extract/storage.mjs` | Partitioned disk lookups, bounded caches, external-sort unique counts |
 | `scripts/extract/assembly.mjs` | Stage-4 geometry/helper placement, shard build, guarded activation |
 | `scripts/extract/source-index.mjs` | Retained-PBF block ranges and tracked reference/cell indexes |
@@ -151,6 +152,13 @@ is omitted. The data timestamp comes from source/replication state rather than
 the current wall clock. Stable serialized content gives a stable ETag.
 
 ## Incremental updates
+
+The temporary external-sort spool uses tab-separated sort keys and a Base64
+JSON payload. This keeps embedded newlines in OSM tag values from splitting a
+record. JSONL and sorted-spool readers split only on the LF byte (with optional
+CR stripping for CRLF files): U+2028 and U+2029 are legal Unicode characters
+inside JSON strings and are not record delimiters. Keep this framing behavior
+when adding readers for persisted JSONL or update intermediates.
 
 The updater reads a positive persisted cursor and an exactly matching feed
 descriptor `{baseUrl, kind, interval, sequenceNumber}`. Regional/day and

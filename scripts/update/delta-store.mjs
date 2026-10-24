@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import readline from 'node:readline';
+import { readLfLines } from '../read-lines.mjs';
 
 const TYPES = new Set(['node', 'way', 'relation']);
 const PARTITIONS = 16384;
@@ -42,7 +42,7 @@ export class DeltaObjectStore {
     try {
       size = (await fs.stat(file)).size;
       if (size > this.maxPartitionBytes) throw new Error(`delta partition ${bucket} is ${size} bytes; compact it before lookup (limit ${this.maxPartitionBytes})`);
-      const rows = readline.createInterface({ input: (await import('node:fs')).createReadStream(file), crlfDelay: Infinity });
+      const rows = readLfLines((await import('node:fs')).createReadStream(file));
       for await (const line of rows) { const row = JSON.parse(line); const key = identity(row.type, row.id); const prev = values.get(key); if (!prev || row.version > prev.version) values.set(key, row); }
     } catch (e) { if (e.code !== 'ENOENT') throw e; }
     const estimated = Math.max(size * 3, values.size * 96);
