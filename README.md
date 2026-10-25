@@ -1,7 +1,7 @@
 # OSMAmenityOverpassServer
 
 A local OSM amenity index serving the narrow Overpass QL subset used by
-Overpass-Proxy. In-scope requests are answered from geohash shards; unsupported
+Overpass-Proxy. In-scope requests are answered from a local SQLite spatial index; unsupported
 requests return `501 {"error":"out of scope"}` so the unmodified proxy can
 fall through to its next upstream. This repository targets full-planet builds
 and has been exercised with Japan data; a planet-scale run is not claimed here.
@@ -12,6 +12,7 @@ and has been exercised with Japan data; a planet-scale run is not claimed here.
 - [Easy planet setup with Docker Compose](easy-setup.md): step-by-step root-server
   deployment, an interactive [setup wizard](scripts/easy-setup.sh), initial planet
   import, and Overpass-Proxy integration without systemd.
+- [SQLite storage, commissioning and backup rules](docs/SQLITE-STORAGE.md).
 - [Installation, commissioning, and operations](docs/OPERATIONS.md): native
   Linux setup, source download, extraction, systemd, proxy integration, Docker,
   updates, monitoring, backup, rollback, and troubleshooting.
@@ -36,19 +37,26 @@ TypeScript ESLint parser (currently TypeScript <6.1).
 ```bash
 npm ci
 npm run build
+OSM_AMENITY_DATA_DIR=/path/to/pipeline/data npm run check-index -- --integrity
 OSM_AMENITY_DATA_DIR=/path/to/pipeline/data npm start
 ```
 
 Set `OSM_AMENITY_UPDATE_BASE_URL` to the exact namespace recorded in the
-generation's `state.json`. For Japan this is normally
+generation's database metadata. For Japan this is normally
 `https://download.geofabrik.de/asia/japan-updates`; the default planet feed
 does not match a regional baseline. See the commissioning guide before starting
 an installation for the first time.
 
-The data directory must be a published generation containing `manifest.json`,
-`state.json`, and `shards/`. A valid empty generation has an explicit empty
-`manifest.shards` array. A missing or invalid generation fails interpreter
-requests instead of returning a misleading empty success.
+The active `data/` directory contains `index.sqlite` in **OAM-SQLITE-1** format.
+SQLite metadata is authoritative; `manifest.json` and `state.json` are diagnostic
+sidecars. Keep SQLite's `index.sqlite-wal` and `index.sqlite-shm` files with the
+live database. A fresh import creates this format directly; no migration is
+provided. See [the storage guide](docs/SQLITE-STORAGE.md) before commissioning.
+The checker also requires a readable retained PBF, seeded replication cursor and
+matching server configuration. Set the exact feed URL before checking. Docker
+and the supplied systemd unit run a lightweight check before service startup;
+`--integrity` performs the full database check explicitly. Missing or invalid
+generation metadata fails interpreter requests.
 
 ## Configuration
 
@@ -57,11 +65,11 @@ requests instead of returning a misleading empty success.
 | `PORT` | `8081` | HTTP listen port |
 | `OSM_AMENITY_DATA_DIR` | `.` | Active generation directory (often pipeline `data/` symlink) |
 | `OSM_AMENITY_AMENITIES` | `toilets` | Comma-separated configured amenity values |
-| `OSM_AMENITY_SHARD_PRECISION` | `5` | Geohash precision, 3 through 7 |
-| `OSM_AMENITY_SHARD_CACHE_MB` | `256` | In-memory shard LRU limit |
+| `OSM_AMENITY_SHARD_PRECISION` | `5` | Compatibility/configuration value, 3 through 7; SQLite queries use an RTree |
+| `OSM_AMENITY_SHARD_CACHE_MB` | `256` | SQLite page-cache budget per query connection (MiB); legacy shard LRU budget |
 | `OSM_AMENITY_UPDATE_INTERVAL_SECONDS` | `3600` | Watch-mode batching window and maximum wait after the last published update; `7200` groups about 120 planet-minute diffs |
 | `OSM_AMENITY_GENERATIONS_TO_KEEP` | `2` | Minimum number of published generations to retain, including the active one (minimum 2); older ones are deleted after a one-hour grace period |
-| `OSM_AMENITY_UPDATE_WORKERS` | `1` | Concurrent update lookup and geometry tasks (1–16) |
+| `OSM_AMENITY_UPDATE_WORKERS` | `1` | Concurrent baseline lookup tasks (1–16); database writes use one writer |
 | `OSM_AMENITY_UPDATE_BASE_URL` | `https://planet.openstreetmap.org/replication` | Replication namespace root; Geofabrik host implies regional/day, otherwise planet/minute |
 | `OSM_AMENITY_SOURCE_PBF` | unset | Optional override for the active generation's retained baseline PBF; its fingerprint must match the active generation |
 | `OSM_AMENITY_REEXTRACT_SOURCE_PBF` | unset | Optional newer immutable PBF for an enabled full rebuild; otherwise the current planet is downloaded |
@@ -100,7 +108,7 @@ See [specification.md](specification.md) for response and storage semantics.
 `--data-dir` is the pipeline root. The working data is under `work/`; the
 published server generation is under `data/`. Stage 0 accepts `--source` (with
 `--planet-source` as an alias); stages 1–3 extract amenities and resolve way
-and node references; stage 4 assembles and atomically publishes OAM shards.
+and node references; stage 4 builds a resumable SQLite database and atomically publishes the baseline.
 
 ```bash
 node scripts/extract.mjs \
@@ -108,7 +116,7 @@ node scripts/extract.mjs \
   --data-dir /path/to/pipeline \
   --stages 0-4 \
   --chunk-mb 256 --ram-mb 8192 --worker-ram-mb 2048 --workers 3 \
-  --all-amenity-values true --verify
+  --amenities toilets --verify
 ```
 
 Supported extraction options are `--source`/`--planet-source`, `--data-dir`,
@@ -150,7 +158,7 @@ exits nonzero; public endpoint availability is not guaranteed.
 ## Replication and current limits
 
 The updater reads a namespace-local replication cursor and applies contiguous
-minute/day diffs through immutable generations. A periodic full rebuild is
+minute/day diffs atomically into the active SQLite baseline. A periodic full rebuild is
 optional and disabled by default: the narrow amenity index does not require it
 for normal sequential updates. The delta overlay retains changes to otherwise
 uninteresting OSM objects because a future toilet way or relation may refer to
@@ -182,7 +190,7 @@ waits for the configured interval. It applies a large backlog immediately.
 Explicit one-shot updater runs still apply available diffs immediately. For example,
 `OSM_AMENITY_UPDATE_INTERVAL_SECONDS=7200` targets roughly two-hour batches on
 the planet minute feed. After an error, the next check occurs within five
-minutes. Larger windows reduce per-generation work but increase data age.
+minutes. Larger windows amortize transaction and lookup work but increase data age.
 
 Before applying a contiguous diff batch, the updater coalesces changes for the
 same typed OSM ID (node, way, or relation) and keeps only that object's final
@@ -201,58 +209,40 @@ the raw TSV spool is capped at 128 GiB. Leave room for the sorted copy and
 reduced output under the update-diffs work directory. This reduces duplicate
 work but does not guarantee that a planet-scale update will catch up.
 
-After coalescing, the updater runs independent baseline lookups and amenity
-geometry tasks concurrently, up to `OSM_AMENITY_UPDATE_WORKERS`. Each task
-resolves node, way, and relation dependencies against the same final object
-overlay. Completed geometry is merged in stable object-ID order, and a
-coordinator writes each affected shard once before validation and publication.
-Relevant changes are compared with the retained baseline PBF once. After the
-grouped delta import, those validated versions are loaded from the overlay for
-the shard rebuild; unchanged dependencies still use version-aware baseline
-resolution.
-For large batches, the updater also scans the coalesced objects sequentially
-and filters potentially affected keys using a bounded tracked-key filter.
-The stream is already grouped by disk partition. Each partition is written
-once, with different partitions processed concurrently up to the worker limit.
-The filter only skips index lookups for keys it can prove absent; it never
-suppresses a tracked change. The full delta overlay is retained so later
-geometry references and future updates can resolve changed objects. The
-affected-change scan and grouped writes report object counts and phase ETAs.
-The setting is separate from initial extraction workers. More update workers
-increase concurrent `osmium cat` processes, temporary PBF files, RAM use, and
-disk I/O; compare full catch-up rates when tuning it.
-The grouped import reads the reduced spool directly; it does not write another
-copy of all changed objects.
-After a successful catch-up or an up-to-date check, the updater removes leftover
-downloaded update/re-extract diffs through the published sequence and abandoned
-coalescing, re-extract work, staging-generation, and PBF-lookup directories
-from earlier runs. It retains the active and newest rollback generation by
-default and deletes older published generations after a one-hour grace period.
-Retained source PBFs and reusable source indexes remain. A cleanup failure is logged without undoing an
-already published update.
+After coalescing, the updater stages changes in a disk-backed temporary SQLite
+table, finds affected amenities through an indexed dependency table, and applies
+the batch in one `BEGIN IMMEDIATE` transaction. It retains the complete current
+delta overlay, including objects currently unrelated to toilets, because future
+amenities can reference them. Baseline versions are checked lazily and cached;
+`OSM_AMENITY_UPDATE_WORKERS` controls concurrent baseline PBF lookup batches.
+Affected amenity geometries and spatial entries are rebuilt, and trigger-maintained
+counts, data timestamp, and replication cursor commit together. There is no
+per-diff generation clone, full spatial scan, external recount, or per-cell file
+sync. Readers use consistent WAL snapshots while updates commit.
 
-The line pipeline is partitioned and bounded in its lookups, but Japan success
-does not demonstrate planet-size runtime or resource bounds. Relations currently
-have aggregate bounds and direct member expansion; nested relation closure and
-full public Overpass parity remain limited.
+The first update may build a compact PBF block index with a sequential source
+scan. Keep the immutable baseline PBF available: newly referenced objects can
+require it. The raw-object overlay grows with distinct objects in planet diffs;
+a rebuild from a newer PBF resets that accumulated overlay.
 
-Each update batch hardlinks the generation tree and scans its shard inventory
-for validation and an exact recount. Publication also syncs the generation tree.
-This work scales with the complete index, even when few shards change. Dependency
-closure is capped at 50,000 tracked objects, affected cells at 5,000, rebuilt rows
-at 64 MiB, and each resolved-object lookup at 64 MiB. The shared geometry
-member-object cache has no aggregate byte cap; total updater RAM is not bounded
-by that per-lookup limit. A batch exceeding a checked limit
-fails without advancing the cursor; reduce the update interval or use a newer
-baseline. These checks do not establish planet memory bounds or throughput.
-Retain the baseline PBF unchanged while it serves updates; provide a newer
-snapshot through a separate re-extract path. Keep separate backups if older
-generations are needed; the online retention policy is not a backup.
+After successful updates, cleanup removes downloaded diffs, abandoned update work
+and obsolete baseline generations under the configured retention policy. Ordinary
+diffs update the same database in place; historical per-diff rollback generations
+are no longer created. Retained generations represent full baseline rebuilds.
+Use a stopped-service backup or SQLite backup tooling for point-in-time recovery.
 
-While a catch-up is running, the updater emits a progress heartbeat about every
-30 seconds. Logs identify the current phase (source-PBF hashing/indexing, diff
-download and parsing, baseline object resolution, shard rebuild, recount,
-validation, or disk sync), with a phase rate and ETA when a total is known.
+Geometry builds limit each amenity to 50,000 dependency objects, an estimated
+64 MiB raw-object cache, and relation depth 16. A batch is limited to 50,000 affected
+amenities. The initial stages resolve direct relation members; Stage 4 resolves missing
+nested members through the retained PBF index. Full public Overpass parity remains limited. These
+bounds and fixture tests do not establish planet-scale throughput or host-wide
+memory limits. No full-planet performance claim is made without a measured run.
+
+While a catch-up runs, progress logs identify download, coalescing, baseline
+resolution, delta import, affected geometry rebuild, and transaction commit.
+SQLite checkpoints also write changed database pages; long readers can postpone
+checkpoint completion. The JSON sidecars are refreshed after commit and may lag
+after a crash; serving and cursor validation always use the database.
 
 The coalescing sort shows a byte-based percentage: the first half tracks
 input read by `sort`, the second half tracks sorted output written. Progress can
@@ -263,7 +253,7 @@ For a planet/minute feed, the backlog can only shrink if the sustained end-to-en
 processing rate exceeds one replication diff per minute; compare the reported
 diff-processing rate across several log entries. Phase ETAs are estimates for
 that phase, not a promise for the complete update. The active replication cursor
-is still published only after the whole batch validates and activates. After
+is still published only when the whole batch commits. After
 publication, a catch-up assessment reports the completed batch rate and how much
 the feed advanced during the run. If diffs remain, the updater checks whether
 the next batch should start immediately or wait for the configured window.

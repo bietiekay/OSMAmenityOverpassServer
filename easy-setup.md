@@ -42,7 +42,7 @@ The wizard asks for:
   and port.
 - The existing proxy's location and service name, its reachable backend URL when
   remote, and optional fallback upstreams.
-- Served amenity values, shard precision/cache, update/rebuild intervals, and
+- Served amenity values, compatibility precision, SQLite cache, update/rebuild intervals, and
   logging verbosity.
 - Initial extraction RAM/worker/chunk budgets, retention of intermediate amenity
   values and chunks, and source/chunk verification.
@@ -55,44 +55,11 @@ space; serving a new value later requires rerunning extraction from the PBF.
 Either choice serves only the amenity values configured for the active index
 and server. It does not turn on every amenity automatically.
 
-**Shard precision** controls how the geographic index is divided into cells;
-it does not set shard file size in megabytes. A higher number creates smaller
-geographic cells and more shard files, while a lower number creates fewer,
-larger shards. Large shards can take longer to read and may exceed the build's
-per-cell memory budget. The default is `5`; keep it unless you have a specific
-reason to tune it. The server's configured precision must match the imported
-index.
-
-Approximate cell dimensions for the supported values (width × height at the
-equator):
-
-| Precision | Approximate cell dimensions |
-|---:|---:|
-| 3 | 156 × 156 km |
-| 4 | 39 × 19.5 km |
-| 5 | 4.9 × 4.9 km |
-| 6 | 1.2 km × 610 m |
-| 7 | 153 × 153 m |
-
-At Germany's latitude, east-west width is about 60% of the equatorial value;
-north-south height stays nearly the same. These are geographic cell dimensions,
-not the size of the corresponding shard file.
-
-For a query, the server finds the cells touched by its bounding box and loads
-those shards. With higher precision, a small-area query usually reads less
-unrelated nearby data, but may need to open more small shard files, especially
-for larger query areas. With lower precision, it opens fewer shards, but each
-can contain more unrelated nearby objects to inspect. Precision therefore
-affects query work and storage layout, not the geographic accuracy of the
-returned results. The default `5` balances these costs; changing it requires
-rebuilding the index and matching the server setting.
-
-For example, at precision `5`, a query around one neighborhood will usually
-touch only a few cells of roughly 5 km across, while a country-wide query will
-touch many. Increasing to precision `6` may reduce unrelated data for the
-neighborhood query, but increases the number of separate shards loaded for a
-country-wide query. Cell borders matter too: a small query can touch multiple
-cells when it crosses a border.
+**Shard precision** remains a compatibility/configuration value (default `5`).
+Fresh OAM-SQLITE-1 imports use an RTree spatial index and create no geographic
+shard files. The imported and server configuration values must still match.
+The cache setting now budgets the SQLite page cache per query connection.
+See [SQLite storage](docs/SQLITE-STORAGE.md) for schema and operational details.
 
 ### Storage and disk space
 
@@ -103,7 +70,7 @@ The three paths have different jobs:
   full downloaded file size, plus space for a partial download while one is in
   progress.
 - **Pipeline directory** is the main data volume. It contains temporary PBF
-  chunks, intermediate extraction and lookup files, the active shard index, and
+  chunks, intermediate extraction and lookup files, the active SQLite index, and
   may retain old generations during rebuilds. The chunk set is roughly another
   source-sized copy; intermediate files and the index add more, and enabled
   rebuilds can temporarily need space alongside the current generation and
@@ -187,11 +154,10 @@ completed outputs and may take hours. If Stage 0 itself was interrupted, the
 wizard offers the same choice when a partial manifest exists. Trust mode still
 scans PBF block headers to reconstruct the chunk plan, then reuses completed
 chunk markers without hashing their contents. Stages 1–3 skip completed
-chunks and reuse completed intermediate results. Stage 4 reuses completed
-amenity-chunk mappings and finished shards. If interrupted while building a
-node or way lookup, that lookup is rebuilt; if interrupted while counting
-unique objects, the counts are calculated again. The last unfinished mapping,
-shard, or counting step is repeated.
+chunks and reuse completed intermediate results. Stage 4 reuses committed SQLite input chunks and its geometry cursor.
+An interrupted input chunk or geometry batch is repeated. Database integrity
+and source/configuration fingerprints protect publication. No per-cell spools,
+shard files or partitioned lookup trees are created.
 
 For later operation, use the generated wrapper:
 
@@ -211,6 +177,12 @@ monitor disk usage and apply the retention procedures below.
 The following sections provide the equivalent manual installation and explain
 commissioning and operation. Choose the wizard or the manual installation; do
 not run both initial setup paths against the same pipeline.
+
+Fresh imports now build **OAM-SQLITE-1**. Choose a new, empty pipeline and a
+new deployment directory when replacing an OAM1 installation. There is no
+migration; `--resume` refuses a legacy active index and leaves its files intact.
+Keep the previous deployment stopped or serving from its own separate pipeline
+until the new database passes commissioning.
 
 ## 1. Prepare the host and select your Compose command
 
@@ -281,7 +253,7 @@ this guide and the current Dockerfile. Git credentials may be required for the
 clone, depending on repository access.
 
 Keep `/srv/osm-amenity/pipeline` on one local filesystem: publication uses
-symlinks, hardlinks, atomic renames, and Linux `flock`. The whole pipeline must
+SQLite WAL, symlinks, atomic renames, and Linux `flock`. The whole pipeline must
 be writable. The source directory is mounted read-only inside the containers.
 
 ## 3. Download the planet once and verify the download
@@ -354,6 +326,12 @@ services:
     build: .
     restart: unless-stopped
     stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "--input-type=module", "-e", 'const r = await fetch("http://127.0.0.1:8081/api/status"); const s = await r.json(); if (!r.ok || s.localEngine?.storageFormat !== "OAM-SQLITE-1" || !(s.localEngine.replication?.sequenceNumber > 0)) process.exit(1);']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     env_file:
       - /srv/osm-amenity/server.env
     ports:
@@ -463,17 +441,21 @@ cause first. Remove the stopped container with `docker rm osm-amenity-import`
 and rerun the same import command to resume completed work. Keep the pipeline
 and source file; do not run two imports or an import and updater concurrently.
 
-After a successful import, inspect the published metadata:
+After a successful import, validate the database and its authoritative metadata:
 
 ```bash
 readlink -f /srv/osm-amenity/pipeline/data
-cat /srv/osm-amenity/pipeline/data/manifest.json
-cat /srv/osm-amenity/pipeline/data/state.json
+dc run --rm --no-deps -T amenity-server \
+  node scripts/check-index.mjs --integrity --require-elements
 ```
 
-Expect an active generation with `manifest.json`, `state.json`, and `shards/`,
-a nonempty shard inventory for planet toilets, and a positive planet/minute
-replication cursor. `/osm` is the pipeline root; `/osm/data` is the published
+Expect an active generation with `index.sqlite` and diagnostic `manifest.json`
+and `state.json` sidecars, populated main-object counters, and a positive planet/minute
+replication cursor. The checker reads SQLite directly and verifies the configured
+amenities, compatibility value, exact feed namespace, data timestamp, counters,
+integrity and retained source readability. It does not hash the source; the updater
+validates its fingerprint before using it. An empty configured index is rejected
+by `--require-elements`, which is appropriate for a planet toilets import. `/osm` is the pipeline root; `/osm/data` is the published
 generation used by the server.
 
 ## 7. Start the service and test it locally
@@ -484,6 +466,13 @@ dc up -d amenity-server
 dc ps
 dc logs --tail=100 -f amenity-server
 ```
+
+The Docker launcher runs a metadata/configuration/source check before starting
+the HTTP server and updater. Full integrity scanning is reserved for the explicit
+commissioning check above, so restarts do not rescan the complete database.
+Explicit import and update commands override the launcher. Easy Setup also adds
+a Compose healthcheck for the storage format and a positive replication cursor;
+that check does not prove the feed is current.
 
 Docker's `restart: unless-stopped` restarts the service after failures and when
 the Docker daemon returns after a host reboot, provided you did not explicitly
@@ -522,13 +511,15 @@ Check the updater logs for `applied planet/minute sequences ...` or
 `up to date at ...`. The HTTP service can stay available while updates fail.
 A planet baseline can already be several days old when downloaded; the first
 catch-up may exceed the current batch limits (including 2 GiB of compressed
-diffs, 50,000 affected objects, or 5,000 affected cells). Such a failure does not
+diffs or 50,000 affected amenities). Such a failure does not
 advance the cursor. A shorter sleep interval only reduces future batch sizes;
 it does not split an existing oversized backlog. See
 [operations and current limits](docs/OPERATIONS.md#8-optional-source-refresh-and-routine-monitoring).
 If even the newest published planet cannot catch up within these limits,
 planet replication needs implementation work before this deployment can be
-considered current. Do not bypass the limits by editing `state.json`.
+considered current. Do not edit replication metadata to skip changes.
+`state.json` is only a diagnostic sidecar; changing it does not change the cursor
+in SQLite.
 
 ## 8. Connect your existing Overpass-Proxy
 
@@ -632,11 +623,12 @@ Monitor free disk space/inodes, container memory, update errors, and the data
 timestamp. The updater retains at least two published generations by default,
 including the active one. Older published generations are removed after a
 one-hour grace period during successful updater cleanup. Set
-`OSM_AMENITY_GENERATIONS_TO_KEEP` higher to retain more rollback points.
+`OSM_AMENITY_GENERATIONS_TO_KEEP` higher to retain more full-baseline rollback points.
 Keep backups separately; retention does not protect them.
-The geometry member-object cache currently has no aggregate memory cap, and
-updates validate/recount the full shard inventory. Japan results do not
-establish planet memory bounds or sustained update throughput.
+Ordinary diffs update the active database in place, without full-index recounts
+or per-diff generation copies. Retention applies to full baseline rebuilds, so
+it does not preserve individual diff rollback points. Use backups for those.
+Geometry builds have per-amenity budgets; planet throughput still needs measurement.
 
 Scheduled full rebuilding is disabled by default. Normal replication updates
 continue without it. Set `OSM_AMENITY_REEXTRACT_ENABLED=true` to opt in; the
@@ -663,7 +655,7 @@ Do not rerun the initial extraction against an already updated active pipeline.
 
 For a consistent backup, stop the service and archive the entire pipeline,
 retained source PBFs, `/srv/osm-amenity/server.env`, your Compose file, and the
-application Git revision. Preserve symlinks and hardlinks, verify restoration,
+application Git revision. Preserve symlinks and all SQLite files (including WAL), verify restoration,
 then start the service again. The updater manages old published generations;
 manual removal should be done only during a maintenance stop after checking
 the active `data` symlink and backup/rollback requirements. Never remove the

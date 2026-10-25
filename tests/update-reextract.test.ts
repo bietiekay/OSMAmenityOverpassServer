@@ -10,7 +10,9 @@ import { encodeElement } from '../scripts/extract/lines.mjs';
 import { buildIndex } from '../scripts/extract/assembly.mjs';
 import { applyDiffGeneration } from '../scripts/update/apply-generation.mjs';
 import { isReextractDue, maybeRunReextract, runReextract } from '../scripts/update/reextract.mjs';
-import { readShard } from '../src/index/shard.js';
+import { IndexDatabase } from '../src/index/database.js';
+import { writeState } from '../scripts/database/metadata.mjs';
+import { databaseElements } from './database-helpers.js';
 
 const replication = { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' } as const;
 const snapshotTime = '2026-10-14T00:00:00Z';
@@ -71,10 +73,7 @@ async function extractionFor(fixture: Awaited<ReturnType<typeof makeFixture>>, a
 }
 
 async function allElements(pipelineDir: string) {
-  const manifest = JSON.parse(await fs.readFile(path.join(pipelineDir, 'data/manifest.json'), 'utf8'));
-  const elements = [];
-  for (const cell of manifest.shards) elements.push(...readShard(await fs.readFile(path.join(pipelineDir, 'data/shards', `${cell}.bin`))).elements);
-  return elements;
+  return databaseElements(path.join(pipelineDir, 'data'));
 }
 
 describe('weekly drift re-extract', () => {
@@ -104,7 +103,7 @@ describe('weekly drift re-extract', () => {
       const activeStatePath = path.join(fixture.pipelineDir, 'data/state.json');
       const activeState = JSON.parse(await fs.readFile(activeStatePath, 'utf8'));
       activeState.replication = { ...planet, sequenceNumber: 1 }; activeState.lastSeq = 1;
-      await fs.writeFile(activeStatePath, JSON.stringify(activeState));
+      await writeState(path.dirname(activeStatePath), activeState);
       await runReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, amenities: ['toilets'], shardPrecision: 5,
         replication: planet, extraction: await extractionFor(fixture, undefined, planet), fetchImpl: fetcher(1, null) });
       expect(JSON.parse(await fs.readFile(activeStatePath, 'utf8')).lastSeq).toBe(1);
@@ -151,7 +150,7 @@ describe('weekly drift re-extract', () => {
           sourceTimestamp: snapshotTime, replication: { ...replication, sequenceNumber: 0 }, amenities: ['toilets'], shardPrecision: 5 });
         const statePath = path.join(candidate.generationDir, 'state.json');
         const state = JSON.parse(await fs.readFile(statePath, 'utf8')); state.replication.sequenceNumber = 0;
-        await fs.writeFile(statePath, JSON.stringify(state));
+        await writeState(path.dirname(statePath), state);
       };
       const before = await fs.realpath(path.join(fixture.pipelineDir, 'data'));
       await expect(runReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, replication,
@@ -175,7 +174,7 @@ describe('weekly drift re-extract', () => {
     try {
       const statePath = path.join(fixture.pipelineDir, 'data/state.json');
       const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
-      state.replication.baseUrl = 'https://other.example/updates'; await fs.writeFile(statePath, JSON.stringify(state));
+      state.replication.baseUrl = 'https://other.example/updates'; await writeState(path.dirname(statePath), state);
       const extraction = vi.fn();
       await expect(runReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, replication, extraction })).rejects.toThrow(/does not match the active generation/);
       expect(extraction).not.toHaveBeenCalled();
@@ -190,7 +189,7 @@ describe('weekly drift re-extract', () => {
         const candidate = await deps.buildIndex({ pipelineDir: scratch, source: fixture.source, sourceFingerprint: fixture.fingerprint,
           sourceTimestamp: snapshotTime, replication: { ...replication, sequenceNumber: 1 }, amenities: ['toilets'], shardPrecision: 5 });
         const statePath = path.join(candidate.generationDir, 'state.json'); const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
-        state.sourceFingerprint = null; await fs.writeFile(statePath, JSON.stringify(state));
+        state.sourceFingerprint = null; await writeState(path.dirname(statePath), state);
       };
       const active = await fs.realpath(path.join(fixture.pipelineDir, 'data'));
       await expect(runReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, replication, extraction })).rejects.toThrow(/provenance is incomplete/);
@@ -208,7 +207,8 @@ describe('weekly drift re-extract', () => {
         const candidate = path.join(generations, candidates[0]);
         const manifestPath = path.join(candidate, 'manifest.json');
         const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-        manifest.configHash = '0'.repeat(64); await fs.writeFile(manifestPath, JSON.stringify(manifest));
+        manifest.configHash = '0'.repeat(64);
+        const db = new IndexDatabase(candidate); try { db.setMetadata('manifest', manifest); db.db.exec('DELETE FROM spatial'); } finally { db.close(); }
         return new Response(`sequenceNumber=000000001\ntimestamp=${snapshotTime}\n`, { status: 200 });
       };
       await expect(runReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, replication,
@@ -225,7 +225,7 @@ describe('weekly drift re-extract', () => {
       const activeStatePath = path.join(fixture.pipelineDir, 'data/state.json');
       const state = JSON.parse(await fs.readFile(activeStatePath, 'utf8'));
       state.replication.sequenceNumber = 0;
-      await fs.writeFile(activeStatePath, JSON.stringify(state));
+      await writeState(path.dirname(activeStatePath), state);
       const before = await fs.realpath(path.join(fixture.pipelineDir, 'data'));
       await expect(runReextract({ dataDir: fixture.pipelineDir, sourcePbf: fixture.source, replication,
         amenities: ['toilets'], shardPrecision: 5, extraction: await extractionFor(fixture), fetchImpl: fetcher(2, addToilet)
@@ -365,7 +365,7 @@ describe('weekly drift re-extract', () => {
       activeState.replication = { baseUrl, kind: 'planet', interval: 'minute', sequenceNumber: 1 };
       activeState.lastSeq = 1;
       activeState.lastReextractAt = '2026-10-01T00:00:00Z';
-      await fs.writeFile(statePath, JSON.stringify(activeState));
+      await writeState(path.dirname(statePath), activeState);
       // The source PBF is real; the shim supplies its replication header metadata
       // while delegating all extraction and source-index commands to osmium.
       const bin = path.join(fixture.root, 'bin'); await fs.mkdir(bin);

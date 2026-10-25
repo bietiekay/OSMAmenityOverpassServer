@@ -7,15 +7,23 @@ services:
       OSM_AMENITY_DATA_DIR: /osm/data
       OSM_AMENITY_SOURCE_PBF: /source/region.osm.pbf
       OSM_AMENITY_AMENITIES: toilets
-      # Defaults: precision 5, 256 MB cache, hourly update-loop wake interval.
+      # SQLite: compatibility precision 5, 256 MiB page cache per query, hourly update window.
       # For Japan Geofabrik daily replication:
       # OSM_AMENITY_UPDATE_BASE_URL: https://download.geofabrik.de/asia/japan-updates
-      # OSM_AMENITY_REEXTRACT_EVERY_SECONDS: 604800
+      # OSM_AMENITY_REEXTRACT_ENABLED: "false"
+      # OSM_AMENITY_REEXTRACT_EVERY_SECONDS: 15552000
       # LOG_VERBOSITY: info
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "--input-type=module", "-e", 'const r = await fetch("http://127.0.0.1:8081/api/status"); const s = await r.json(); if (!r.ok || s.localEngine?.storageFormat !== "OAM-SQLITE-1" || !(s.localEngine.replication?.sequenceNumber > 0)) process.exit(1);']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     ports:
       - "127.0.0.1:8081:8081"
     volumes:
-      # Writable pipeline root: active data link, immutable generations, and work/.
+      # Writable pipeline root: active SQLite baseline/WAL, rebuild baselines, and work/.
       - ${OSM_AMENITY_PIPELINE_DIR:-./pipeline}:/osm:rw
       # Retained source PBF is mounted read-only at the path supplied above.
       - ${OSM_AMENITY_SOURCE_PBF_HOST:?Set OSM_AMENITY_SOURCE_PBF_HOST to a retained PBF file}:/source/region.osm.pbf:ro

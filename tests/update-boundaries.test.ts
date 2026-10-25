@@ -9,7 +9,8 @@ import { encodeElement } from '../scripts/extract/lines.mjs';
 import { buildIndex } from '../scripts/extract/assembly.mjs';
 import { activateGeneration, withGenerationLock } from '../scripts/update/generation.mjs';
 import { applyDiffBatchGeneration, applyDiffGeneration } from '../scripts/update/apply-generation.mjs';
-import { buildConfigHash, readShard, writeShard } from '../src/index/shard.js';
+import { databaseElements } from './database-helpers.js';
+import { buildConfigHash, writeShard } from '../src/index/shard.js';
 
 const replication = { baseUrl: 'https://planet.example/minute', kind: 'planet', interval: 'minute' };
 
@@ -79,8 +80,7 @@ describe('generation and updater boundary guards', () => {
       expect(created.changedCount).toBe(1);
       const manifest = JSON.parse(await fs.readFile(path.join(root, 'data', 'manifest.json'), 'utf8'));
       expect(manifest.totalElements).toBe(1);
-      const elements = [];
-      for (const cell of manifest.shards as string[]) elements.push(...readShard(await fs.readFile(path.join(root, 'data', 'shards', `${cell}.bin`))).elements);
+      const elements = databaseElements(path.join(root, 'data'));
       const way = elements.find((element) => element.type === 'way' && element.id === 5);
       expect(way?.memberCoords.size).toBe(2);
     } finally { await fs.rm(root, { recursive: true, force: true }); }
@@ -103,7 +103,7 @@ describe('generation and updater boundary guards', () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
-  it('coalesces repeated objects and merges concurrent geometry tasks once per shard', async () => {
+  it('coalesces repeated objects and updates each main object once', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'update-parallel-'));
     try {
       await createPipeline(root);
@@ -113,8 +113,7 @@ describe('generation and updater boundary guards', () => {
       expect(result.changedCount).toBe(3);
       const manifest = JSON.parse(await fs.readFile(path.join(root, 'data', 'manifest.json'), 'utf8'));
       expect(manifest.totalElements).toBe(3);
-      const rows = [];
-      for (const cell of manifest.shards as string[]) rows.push(...readShard(await fs.readFile(path.join(root, 'data', 'shards', `${cell}.bin`))).elements);
+      const rows = databaseElements(path.join(root, 'data'));
       const nodes = new Map(rows.filter((row) => row.type === 'node' && row.tags?.amenity === 'toilets').map((row) => [row.id, row]));
       expect([...nodes.keys()].sort()).toEqual([1, 3, 4]);
       expect(nodes.get(1)?.version).toBe(4);

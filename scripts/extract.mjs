@@ -7,7 +7,7 @@
  *   Stage 1: stream native osmium XML through the amenity filter.
  *   Stage 2: resolve global member-way references across chunks.
  *   Stage 3: resolve member-node coordinates through a sorted streaming merge.
- *   Stage 4: assemble disk-backed lookups and publish immutable OAM shards.
+ *   Stage 4: build a resumable SQLite baseline and publish it atomically.
  *
  * Fingerprinted work manifests and done-markers support abort and resume.
  * Outputs use temporary files and rename; activation uses the generation lock.

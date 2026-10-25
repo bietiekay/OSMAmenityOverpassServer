@@ -75,11 +75,15 @@ if [[ $1 == compose ]]; then
         touch "$MOCK_ROOT/container"
         mkdir -p "$MOCK_PIPELINE/data"
         echo '{"generation":"test"}' > "$MOCK_PIPELINE/data/manifest.json"
+        touch "$MOCK_PIPELINE/data/index.sqlite"
         echo mock-container-id
       elif [[ " $* " == *sourceMetadata* ]]; then
         if [[ \${MOCK_BAD_HEADER:-0} == 1 ]]; then echo 'invalid source provenance' >&2; exit 1; fi
         echo 'OSM_AMENITY_UPDATE_BASE_URL=https://planet.openstreetmap.org/replication/minute'
         echo 'OSM_AMENITY_REPLICATION_SEQUENCE_NUMBER=7325026'
+      elif [[ " $* " == *scripts/check-index.mjs* ]]; then
+        [[ \${MOCK_BAD_INDEX:-0} != 1 ]] || { echo 'Index check failed: Replication URL mismatch' >&2; exit 1; }
+        echo 'validated SQLite index'
       else
         echo 'validated generation'
       fi
@@ -128,6 +132,8 @@ describe('interactive Docker setup', () => {
     expect(compose).toContain(`- '${w.pipeline}:/osm:rw'`);
     expect(compose).toContain("'127.0.0.1:9091:8081'");
     expect(compose).toContain("aliases: ['test-amenity']");
+    expect(compose).toContain('healthcheck:');
+    expect(compose).toContain('OAM-SQLITE-1');
     const env = readFileSync(path.join(w.deployment, 'server.env'), 'utf8');
     expect(env).toContain('OSM_AMENITY_AMENITIES=toilets,drinking_water');
     expect(env).toContain('OSM_AMENITY_SHARD_PRECISION=6');
@@ -197,6 +203,7 @@ describe('interactive Docker setup', () => {
     expect(log).toContain('--amenities\ttoilets,drinking_water\t--shard-precision\t6');
     expect(log).toContain('--ram-mb\t6144\t--worker-ram-mb\t2048\t--workers\t2');
     expect(log).toContain('--verify\ttrue');
+    expect(log).toContain('scripts/check-index.mjs\t--integrity\t--require-elements');
     expect(log).toContain('scripts/verify-http.mjs');
     expect(readFileSync(path.join(w.deployment, 'server.env'), 'utf8')).toContain(
       'OSM_AMENITY_UPDATE_BASE_URL=https://planet.openstreetmap.org/replication/minute'
@@ -264,6 +271,7 @@ describe('interactive Docker setup', () => {
     expect(result.stderr).toContain('Partial download belongs to another snapshot');
     expect(readFileSync(partial, 'utf8')).toBe('unrelated partial bytes');
     mkdirSync(path.join(w.pipeline, 'data'));
+    writeFileSync(path.join(w.pipeline, 'data/index.sqlite'), 'existing database');
     const active = run(['--resume', w.deployment], '\n', docker);
     expect(active.status).toBe(1);
     expect(active.stderr).toContain('lost its retained baseline');
@@ -280,4 +288,36 @@ describe('interactive Docker setup', () => {
     expect(result.stderr).toContain('Invalid or duplicate saved setting');
     expect(existsSync(sentinel)).toBe(false);
   });
+  it('explains SQLite cache and baseline retention without describing geographic shard files', () => {
+    const w = workspace();
+    const result = run(['--configure-only'], answers(w));
+    expect(result.status).toBe(0);
+    expect(result.stdout + result.stderr).toContain('SQLite page cache per HTTP query connection');
+    expect(result.stdout).toContain('Ordinary diffs update the active database in place');
+    expect(result.stdout).not.toContain('Each query loads the cells');
+  });
+
+  it('refuses a legacy pipeline on resume without starting imports or modifying existing data', () => {
+    const w = workspace(); configure(w);
+    mkdirSync(path.join(w.pipeline, 'data'), { recursive: true });
+    const manifest = path.join(w.pipeline, 'data/manifest.json');
+    writeFileSync(manifest, '{"format":"OAM1"}');
+    const docker = mockDocker(w);
+    const result = run(['--resume', w.deployment], '\n', docker);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('No migration is provided');
+    expect(readFileSync(manifest, 'utf8')).toBe('{"format":"OAM1"}');
+    expect(existsSync(path.join(w.root, 'container'))).toBe(false);
+    expect(existsSync(path.join(w.root, 'started'))).toBe(false);
+  });
+
+  it('does not start the service when SQLite commissioning validation fails', () => {
+    const w = workspace(); configure(w);
+    const docker = mockDocker(w);
+    const result = run(['--resume', w.deployment], '\n'.repeat(4), { ...docker, MOCK_BAD_INDEX: '1' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Index check failed: Replication URL mismatch');
+    expect(existsSync(path.join(w.root, 'started'))).toBe(false);
+  });
+
 });

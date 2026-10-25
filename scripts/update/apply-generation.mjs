@@ -1,4 +1,6 @@
 import fs from 'node:fs/promises';
+import { hasDatabase } from '../database/metadata.mjs';
+import { applyDatabaseDiff } from '../database/update.mjs';
 import path from 'node:path';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -417,6 +419,11 @@ export async function applyDiffGeneration(pipelineDir, diffFile, {
   sourcePbf: sourcePbfOverride = null, sourcePbfFingerprint = null, diffFiles = null,
   candidateGenerationDir = null, fromSequence = null, signal = null, onProgress = () => {}, updateWorkers = null
 }) {
+  const databaseRoot = candidateGenerationDir ?? path.join(pipelineDir, 'data');
+  if (await hasDatabase(databaseRoot)) return applyDatabaseDiff(pipelineDir, diffFile, {
+    sequence, replication, dataTimestamp, amenities, shardPrecision, engine, maxBatchBytes, beforePublish,
+    sourcePbf: sourcePbfOverride, sourcePbfFingerprint, diffFiles, candidateGenerationDir, fromSequence, signal, onProgress, updateWorkers
+  });
   checkAborted(signal);
   const workers = readUpdateWorkers(updateWorkers);
   if (!Number.isSafeInteger(sequence) || sequence <= 0) throw new Error('valid target sequence is required');

@@ -10,6 +10,7 @@ Group=osm-amenity
 WorkingDirectory=/opt/osm-amenity-server
 EnvironmentFile=/etc/osm-amenity-server.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/node /opt/osm-amenity-server/scripts/check-index.mjs
 ExecStart=/usr/bin/node /opt/osm-amenity-server/dist/index.js
 Restart=on-failure
 RestartSec=10

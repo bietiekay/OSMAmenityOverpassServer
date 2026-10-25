@@ -8,7 +8,8 @@ import { gzipSync } from 'node:zlib';
 import { encodeElement } from '../scripts/extract/lines.mjs';
 import { buildIndex } from '../scripts/extract/assembly.mjs';
 import { applyDiffGeneration } from '../scripts/update/apply-generation.mjs';
-import { readShard } from '../src/index/shard.js';
+import { IndexDatabase } from '../src/index/database.js';
+import { databaseElements } from './database-helpers.js';
 
 describe('incremental generation updates', () => {
   it('recomputes dependent relation geometry when an unchanged-version member node moves', async () => {
@@ -43,33 +44,26 @@ describe('incremental generation updates', () => {
       await fs.writeFile(pbf, sourcePbfBytes);
       const result = await applyDiffGeneration(root, diff, { sequence: 6, dataTimestamp: '2026-10-15T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 });
       expect(result.sequence).toBe(6);
-      expect(await fs.realpath(path.join(root, 'data'))).not.toBe(oldGeneration);
+      expect(await fs.realpath(path.join(root, 'data'))).toBe(oldGeneration);
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/state.json'), 'utf8'))).toMatchObject({ lastSeq: 0, replication: { sequenceNumber: 6 } });
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/manifest.json'), 'utf8')).totalElements).toBe(oldManifest.totalElements);
       await expectActiveCounts(root);
-      let relation;
-      for (const cell of JSON.parse(await fs.readFile(path.join(root, 'data/manifest.json'), 'utf8')).shards) {
-        const shard = readShard(await fs.readFile(path.join(root, 'data/shards', `${cell}.bin`)));
-        relation ??= shard.elements.find((element) => element.type === 'relation' && element.id === 20);
-      }
+      const relation = databaseElements(path.join(root, 'data')).find(e => e.type === 'relation' && e.id === 20);
       expect(relation?.bbox[0]).toBeCloseTo(34.99);
       expect(relation?.bbox[1]).toBeCloseTo(138.99);
       expect(relation?.bbox[2]).toBeCloseTo(35.1);
       expect(relation?.bbox[3]).toBeCloseTo(139.1);
-      const updatedWay = [...JSON.parse(await fs.readFile(path.join(root, 'data/manifest.json'), 'utf8')).shards]
-        .flatMap(async (cell: string) => readShard(await fs.readFile(path.join(root, 'data/shards', `${cell}.bin`))).elements);
-      const wayElements = await Promise.all(updatedWay);
-      const helperWay = wayElements.flat().find((element) => element.type === 'way' && element.id === 10);
+      const helperWay = databaseElements(path.join(root, 'data')).find(e => e.type === 'way' && e.id === 10);
       expect(helperWay?.memberCoords.get(4)).toEqual({ lat: 34.99, lon: 138.99 });
-      const priorCell = oldManifest.shards.find((cell: string) => cell !== undefined);
-      await expect(fs.stat(path.join(oldGeneration, 'shards', `${priorCell}.bin`))).resolves.toBeDefined();
+      await expect(fs.stat(path.join(oldGeneration, 'index.sqlite'))).resolves.toBeDefined();
       const generationAfterSix = await fs.realpath(path.join(root, 'data'));
       const retry = path.join(root, '007.osc.gz');
       await fs.writeFile(retry, gzipSync('<osmChange version="0.6"><modify><node id="1" version="3" timestamp="2026-10-16T00:00:00Z" lat="35.11" lon="139.11"/></modify></osmChange>'));
       await expect(applyDiffGeneration(root, retry, { sequence: 7, dataTimestamp: '2026-10-16T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5, beforePublish: async () => { throw new Error('simulated pre-publish crash'); } })).rejects.toThrow(/simulated pre-publish crash/);
       expect(await fs.realpath(path.join(root, 'data'))).toBe(generationAfterSix);
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/state.json'), 'utf8')).replication.sequenceNumber).toBe(6);
-      expect((await fs.readFile(path.join(root, 'data/delta-objects', `${hashFor('node:1')}.jsonl`), 'utf8')).includes('"version":3')).toBe(false);
+      const db = new IndexDatabase(path.join(root, 'data'), { readOnly: true });
+      try { expect(db.getRaw('node:1')?.version).toBe(2); } finally { db.close(); }
       await applyDiffGeneration(root, retry, { sequence: 7, dataTimestamp: '2026-10-16T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 });
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/state.json'), 'utf8'))).toMatchObject({ lastSeq: 0, replication: { sequenceNumber: 7 } });
       await expectActiveCounts(root);
@@ -78,10 +72,7 @@ describe('incremental generation updates', () => {
       await applyDiffGeneration(root, deleted, { sequence: 8, dataTimestamp: '2026-10-16T12:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 });
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/manifest.json'), 'utf8')).totalElements).toBe(1);
       await expectActiveCounts(root);
-      const remaining = [];
-      for (const cell of JSON.parse(await fs.readFile(path.join(root, 'data/manifest.json'), 'utf8')).shards) {
-        remaining.push(...readShard(await fs.readFile(path.join(root, 'data/shards', `${cell}.bin`))).elements);
-      }
+      const remaining = databaseElements(path.join(root, 'data'));
       expect(remaining.some((element) => element.type === 'relation' && element.id === 20)).toBe(false);
       expect(remaining.some((element) => element.type === 'relation' && element.id === 21)).toBe(true);
       expect(remaining.some((element) => element.type === 'way' && element.id === 10)).toBe(true);
@@ -89,27 +80,17 @@ describe('incremental generation updates', () => {
       const activeAfterEight = await fs.realpath(path.join(root, 'data'));
       const missing = path.join(root, '009.osc.gz');
       await fs.writeFile(missing, gzipSync('<osmChange version="0.6"><create><way id="30" version="1" timestamp="2026-10-17T00:00:00Z"><nd ref="999"/><tag k="amenity" v="toilets"/></way></create></osmChange>'));
-      await expect(applyDiffGeneration(root, missing, { sequence: 9, dataTimestamp: '2026-10-17T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 })).rejects.toThrow(/missing update reference node:999/);
+      await expect(applyDiffGeneration(root, missing, { sequence: 9, dataTimestamp: '2026-10-17T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day' }, amenities: ['toilets'], shardPrecision: 5 })).rejects.toThrow(/missing references: node:999/);
       expect(await fs.realpath(path.join(root, 'data'))).toBe(activeAfterEight);
       expect(JSON.parse(await fs.readFile(path.join(root, 'data/state.json'), 'utf8')).replication.sequenceNumber).toBe(8);
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }, 60000);
 });
 
-function hashFor(key: string): number {
-  let h = 2166136261;
-  for (const c of key) h = Math.imul(h ^ c.charCodeAt(0), 16777619) >>> 0;
-  return h % 16384;
-}
-
-async function expectActiveCounts(root: string): Promise<void> {
+async function expectActiveCounts(root: string) {
   const manifest = JSON.parse(await fs.readFile(path.join(root, 'data/manifest.json'), 'utf8'));
-  const main = new Set<string>(); const support = new Set<string>(); let shardRecords = 0;
-  for (const cell of manifest.shards as string[]) {
-    const shard = readShard(await fs.readFile(path.join(root, 'data/shards', `${cell}.bin`)));
-    shardRecords += shard.elements.length;
-    for (const element of shard.elements) (element.tags.amenity === 'toilets' ? main : support).add(`${element.type}:${element.id}`);
-  }
-  expect(manifest.totalElements).toBe(main.size);
-  expect(manifest.counts).toMatchObject({ mainUnique: main.size, supportObjects: support.size, shardRecords, duplicatedRecords: shardRecords - main.size - support.size });
+  const elements = databaseElements(path.join(root, 'data'));
+  const main = elements.filter(e => e.tags.amenity === 'toilets');
+  expect(manifest.totalElements).toBe(main.length);
+  expect(manifest.counts).toMatchObject({ mainUnique: main.length, supportObjects: elements.length-main.length, shardRecords: elements.length, duplicatedRecords: 0 });
 }

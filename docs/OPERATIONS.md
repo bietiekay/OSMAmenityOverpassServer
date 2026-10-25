@@ -1,7 +1,9 @@
 # Installation, commissioning, and operations
 
 This guide covers a native Linux installation, followed by optional Docker
-packaging. Japan is the verified dataset. Use the same extraction pipeline for
+packaging. Historical Japan acceptance results describe the previous OAM1 format.
+The SQLite format has native PBF import, HTTP, diff, crash and rebuild fixture
+coverage; full-planet performance is not measured. Use the same extraction pipeline for
 a planet PBF, with a matching planet/minute feed and sufficient disk capacity;
 planet throughput and Docker deployment have not been verified here.
 
@@ -9,10 +11,14 @@ For the implementation contract see [the specification](../specification.md).
 For measured results and outstanding external checks see
 [the acceptance report](../plans/2026-10-15-abnahme.md).
 
+Fresh deployments must use a new pipeline directory. The setup wizard and
+startup check reject legacy active data instead of migrating it. Preserve the
+old installation separately while commissioning the replacement.
+
 ## 1. Prerequisites and filesystem layout
 
-Use Linux with Node.js 26.12.1 or later and npm. The local acceptance used Node 22.23.3 and
-osmium-tool 1.14.0. Install the native dependencies on Debian/Ubuntu:
+Use Linux with Node.js 26.12.1 or later and npm. Historical OAM1 acceptance used Node 22.23.3 and
+osmium-tool 1.14.0; it does not validate the new storage format. Install the native dependencies on Debian/Ubuntu:
 
 ```bash
 sudo apt-get update
@@ -34,21 +40,21 @@ The examples use these paths:
 | `/opt/osm-amenity-server` | Repository, dependencies, compiled server | Deployment administrator |
 | `/srv/osm-sources` | Immutable retained PBF snapshots | Download administrator; service reads |
 | `/var/lib/osm-amenity/japan` | Pipeline root: generations, work, update caches | Service account |
-| `/var/lib/osm-amenity/japan/data` | Symlink to the active immutable generation | Managed by the pipeline |
+| `/var/lib/osm-amenity/japan/data` | Symlink to the active baseline database | Managed by the pipeline |
 | `/etc/osm-amenity-server.env` | Server and updater configuration | Deployment administrator |
 
 Extraction `--data-dir` means the **pipeline root**. Server
 `OSM_AMENITY_DATA_DIR` means its **active `data/` generation**. Keep work and
-generations on the same local filesystem for atomic publication and hardlinks.
+generations on the same local filesystem for atomic publication and SQLite WAL.
 Generation locking requires working Linux `flock` semantics. Leave disk space
 for retained sources, extraction work, update indexes, candidates, and old
 generations. The updater keeps two published generations by default, including
 the active one, and removes older ones after a one-hour grace period. Set
-`OSM_AMENITY_GENERATIONS_TO_KEEP` to a larger value for more rollback points.
+`OSM_AMENITY_GENERATIONS_TO_KEEP` to a larger value for more full-baseline rollback points. Ordinary diffs do not create generations.
 
 The successful Japan resume used a 2.55 GB source, about 4.32 GB of sampled
 pipeline storage, and 1,096.40 MiB peak process-tree RSS. These are measurements
-for the recorded run, not installation sizing guarantees. Reserve additional
+for the historical OAM1 run, not SQLite installation sizing guarantees. Reserve additional
 space and RAM for the OS, HTTP server, concurrent rebuilding, and backups.
 
 ## 2. Install the application and service account
@@ -73,7 +79,7 @@ sudo install -d -m 0755 /srv/osm-sources
 ```
 
 The account needs read/execute access to the checkout and native executables.
-It needs write access to the entire pipeline root, not just `data/shards`.
+It needs write access to the entire pipeline root, including the active SQLite database.
 
 ## 3. Obtain and inspect a source snapshot
 
@@ -124,7 +130,7 @@ sudo -u osm-amenity node /opt/osm-amenity-server/scripts/extract.mjs \
 Stage 0 copies complete PBF blocks into self-contained chunks. Stage 1 streams
 amenity records. Stage 2 resolves referenced ways across chunks. Stage 3 uses
 a sorted streaming merge to resolve nodes without a high-ID bitmap. Stage 4
-assembles shards using disk-backed lookups, validates the candidate, and
+loads SQLite raw objects and geometries, validates the candidate, and
 atomically switches `data/` under the generation lock.
 
 The CLI defaults to **stage 0 only**; specify `--stages 0-4` for a full build.
@@ -137,17 +143,24 @@ These controls are not a host-wide cgroup memory limit.
 It keeps chunks available for that check even when `--keep-chunks false` is
 supplied. It does **not** prove complete semantic parity with public Overpass.
 
-Inspect publication:
+Inspect publication (install and edit the environment file first as shown in section 5):
 
 ```bash
 readlink -f /var/lib/osm-amenity/japan/data
-python3 -m json.tool /var/lib/osm-amenity/japan/data/manifest.json
-python3 -m json.tool /var/lib/osm-amenity/japan/data/state.json
+sudo -u osm-amenity sh -c '
+  set -a
+  . /etc/osm-amenity-server.env
+  set +a
+  cd /opt/osm-amenity-server
+  exec /usr/bin/node scripts/check-index.mjs --integrity --require-elements
+'
 ```
 
-`manifest.counts` distinguishes unique main objects, helper objects, duplicate
-spatial records, and total shard records. `manifest.shards` is authoritative.
-For the exact accepted snapshot, main objects total 32,293 in 6,720 shards.
+`index.sqlite` contains authoritative metadata and exact main/helper counters.
+The JSON sidecars are diagnostic snapshots that may lag a committed update.
+Fresh imports use OAM-SQLITE-1; no migration is provided. See
+[SQLite storage](SQLITE-STORAGE.md) for WAL, backup and update requirements.
+Historic Japan acceptance counts describe the old OAM1 dataset and layout.
 
 ### Resume and additional amenity values
 
@@ -181,11 +194,10 @@ That requires stage 1 to have retained those values, for example through
 `--all-amenity-values true`. Stop the service before deliberately changing
 the served amenity set or precision, and update its environment to match.
 
-In trust mode, Stage 4 saves progress per amenity input chunk and per output
-shard. A restart reuses completed mappings and shards and repeats the first
-unfinished unit. An interrupted node or way lookup build is rebuilt as a
-whole; the final unique-object counting step also runs again if it had not
-finished.
+Stage 4 saves input-chunk completion and a geometry cursor transactionally in
+a private SQLite staging database. A restart reuses committed work and repeats
+the interrupted chunk or geometry batch. No cell spools, binary shards or JSONL
+helper partitions are produced.
 Direct stage activation rejects a snapshot older than an updated active
 generation. For a production configuration change after updates, build a
 separate pipeline from a suitable current source, validate it and its cursor,
@@ -210,7 +222,9 @@ export OSM_AMENITY_SOURCE_PBF="$SNAPSHOT"
 export OSM_AMENITY_AMENITIES=toilets
 export OSM_AMENITY_SHARD_PRECISION=5
 export OSM_AMENITY_UPDATE_BASE_URL=https://download.geofabrik.de/asia/japan-updates
-node /opt/osm-amenity-server/dist/index.js
+cd /opt/osm-amenity-server
+node scripts/check-index.mjs --integrity --require-elements
+node dist/index.js
 ```
 
 Run as the service account or another account with the pipeline permissions.
@@ -224,11 +238,26 @@ schedule after each update cycle. HTTP service can remain available while an
 update fails, so an open port is not evidence of current data.
 
 The configured replication **base URL must match the persisted descriptor** in
-`state.json`, including a `/minute` suffix if the source recorded it. The
+SQLite replication metadata, including a `/minute` suffix if the source recorded it. The
 regional/day mode is inferred from a Geofabrik hostname; other configured hosts
 default to planet/minute. Arbitrary regional mirror hosts and hour feeds have
 no explicit mode override. Do not use global diffs for a Japan-only index.
 Regional sequence numbers are not converted to global minute numbers.
+
+The supplied systemd service runs `scripts/check-index.mjs` as `ExecStartPre`.
+It rejects a legacy or missing database, mismatched server configuration, invalid
+replication state, or an unreadable retained PBF before launching the service.
+Regular startup checks read metadata/counters; `--integrity` explicitly adds a
+full database scan during commissioning. Neither check hashes the PBF; the
+updater validates its fingerprint before use. The Docker default launcher uses
+the same check. Explicit extraction commands bypass the server launcher.
+
+For planet-only toilets, use a new `/var/lib/osm-amenity/planet` pipeline with
+`--stages 0-4 --amenities toilets` and the matching planet/minute baseline.
+[The planet environment example](../deploy/osm-amenity-planet.env.example)
+shows service settings; replace its feed URL with the exact descriptor derived
+from your source. Keep the service stopped until the seeded SQLite index passes
+commissioning. No old-index migration is provided.
 
 ## 6. Commission the HTTP and proxy contracts
 
@@ -389,23 +418,14 @@ The cap is a safety limit, not a disk-space reservation. Coalescing may reduce
 later work substantially when many diffs touch the same objects, but reading,
 sorting, and reducing a planet backlog still costs time and disk I/O. It does
 not establish that the updater will catch up with a live planet feed.
-Set `OSM_AMENITY_UPDATE_WORKERS` in `server.env` to select 1–16 concurrent
-update tasks (default 1). The updater distributes baseline PBF lookups and
-geometry builds after coalescing, resolves each task's dependencies against the
-same final object overlay, and merges results in stable ID order. A coordinator
-writes each affected shard once before validation and atomic publication. This
-setting is independent of extraction `--workers`. Higher values increase
-simultaneous `osmium cat` processes, temporary candidate PBFs, RAM use, and
-disk traffic. Start with 2–3 only if resources permit, then measure completed
-batch throughput and backlog reduction. Changing `server.env` takes effect
-when the updater process is restarted.
-The large coalesced-object import reads changes already grouped by partition
-and writes each partition once, with distinct partitions processed concurrently.
-A bounded filter built from the tracked-object indexes avoids reading both
-indexes for every untracked object. All changed objects remain in the delta
-overlay so later references and update cycles can resolve their latest versions.
-The affected-change scan and grouped-write phases report continuous object
-counts and ETAs. The grouped import does not create another full-size spool.
+Set `OSM_AMENITY_UPDATE_WORKERS` to select 1–16 concurrent baseline PBF lookup
+batches (default 1). SQLite uses a single writer. Coalesced changes are staged
+in a disk-backed temporary table, then relevant amenities are found through
+indexed dependencies. All current delta objects are retained for future geometry
+references. Each affected amenity is rebuilt once against the final batch state;
+its geometry, spatial index, dependencies, counts and cursor commit together.
+No full baseline clone or recount runs for database diffs. Higher lookup worker
+counts increase native process memory and I/O; measure completed batch throughput.
 After a successful update or an up-to-date feed check, cleanup removes leftover
 update/re-extract diff files through the published cursor and abandoned
 coalescing, re-extract work, staging, and PBF-lookup directories from before
@@ -418,8 +438,8 @@ After a batch publishes, `update catch-up assessment:` reports its end-to-end
 rate, how far the feed advanced during the run, and whether the remaining
 backlog shrank or grew. For a planet/minute feed, the backlog must shrink over
 successive runs; if it grows, processing is slower than the feed. Individual
-phase ETAs do not include later phases such as recount, validation, and disk
-sync. When the assessment finds remaining diffs, the updater now starts another
+phase ETAs do not include later phases such as geometry assembly, commit and
+checkpoint writes. When the assessment finds remaining diffs, the updater now starts another
 catch-up cycle immediately instead of waiting an hour. If the backlog still
 grows across cycles, a newer correctly timestamped and replication-seeded
 baseline is needed; adding extraction workers will not make the updater catch
@@ -430,24 +450,28 @@ For Japan, `osm_osm_change: "0"` is intentional; use the regional cursor in
 The first update may scan/hash the full retained PBF to construct source lookup
 indexes. Unchanged file identities reuse attestations on later cycles.
 
-Update limits currently include 100,000 missing diffs, 2 GiB compressed catch-up
-data per batch, 512 MiB per downloaded/decompressed diff, 50,000 tracked affected
-objects, 128 MiB of possibly affected object records, 5,000 affected cells,
-64 MiB rebuilt rows, and a 64 MiB resolved-object
-limit per lookup invocation. The geometry rebuild's shared member-object cache
-has no aggregate byte cap; these limits are not a total update-process memory
-guarantee. A single source-block lookup must also fit its budget. Checked limits
-fail closed.
-Large routine batches may require a shorter wake interval; an already large
-backlog needs a newer baseline rather than merely changing the wake interval.
-Each commit still clones, verifies, recounts, and syncs the whole generation
-tree. See the specification for these planet-scale cost limits.
+Update limits include 100,000 missing diffs, 2 GiB compressed catch-up data per
+batch, bounded diff downloads, 50,000 affected amenities, and per-geometry limits
+of 50,000 dependency objects, 64 MiB estimated raw-object cache and relation depth
+16. Baseline lookups use adaptive bounded batches. These are not host-wide memory
+guarantees. Large backlogs still require reading and sorting global diffs; a newer
+baseline can be necessary if processing cannot keep up. Database updates avoid
+the former complete file-tree clone, validation scan, recount and per-file sync.
 
 ## 9. Backup, restore, rollback, and retention
 
+Ordinary SQLite updates modify the active baseline in place. Retained generation
+directories are full imports/rebuilds, not per-diff snapshots. Record a consistent
+backup when a specific update state must remain recoverable. Never delete the
+live WAL or copy just `index.sqlite` while writers are running. JSON sidecars
+cannot restore a replication cursor; authoritative state lives in the database.
+
+
 Stop the service to obtain a consistent offline backup of the complete pipeline
 root, its retained source files, the environment file, and the application
-revision. Preserve relative symlinks and hardlinks. For example, with an existing
+revision. Preserve relative symlinks and SQLite WAL files. Never copy only the
+main database while a writer is running; use a stopped-service backup or the
+SQLite backup API. For example, with an existing
 backup directory on another filesystem:
 
 ```bash
@@ -461,8 +485,8 @@ Back up the immutable PBFs separately and record their SHA256 hashes. Verify the
 archive and restore on a separate path before relying on the backup. Restore
 while stopped, with the recorded application revision and correct ownership;
 make the matching PBF readable at its recorded path or through a validated
-source override. Keep shard files, manifest, state, and delta objects from the
-same generation. Caches may be rebuilt but can incur full-source scans.
+source override. Keep the database and any WAL from the same consistent backup. JSON sidecars
+are diagnostic; replication state is stored inside SQLite. Caches may be rebuilt but can incur full-source scans.
 
 For an intentional rollback to a retained, verified generation, stop the service
 and activate it through the existing validator/lock, from the repository root:
@@ -492,7 +516,7 @@ generation or its source snapshot.
 
 | Symptom | Check/action |
 |---|---|
-| Interpreter 500, HEAD 200 | Inspect manifest/state/shard inventory, permissions, CRC/config errors in logs; HEAD is a recovery probe, not data readiness. |
+| Interpreter 500, HEAD 200 | Inspect SQLite integrity, authoritative metadata, permissions and config errors in logs; HEAD is a recovery probe, not data readiness. |
 | Configuration hash mismatch | Use the same amenity values and precision for server and build; rebuild a separate pipeline for changes after updates. |
 | Namespace mismatch or unknown baseline | Compare config with source and active replication descriptor; use a correctly seeded snapshot, never cursor 0 or manual sequence edits. |
 | PBF fingerprint mismatch | Restore the exact baseline bytes or supply a matching mounted copy. New snapshots belong in the re-extract path. |

@@ -170,7 +170,7 @@ else
   printf 'Press Enter to accept defaults. Configuration is reviewed before it is written.\n\n'
   printf 'Storage overview (all paths below are on this host):\n'
   printf '  Source:   the original planet PBF download. It is kept unchanged for updates and recovery.\n'
-  printf '  Pipeline: import chunks, intermediate files, indexes and the active served data. Old generations can remain here.\n'
+  printf '  Pipeline: import chunks, intermediate files, indexes and the active served data. Full rebuild baselines and SQLite WAL files can remain here.\n'
   printf '  Config:   small text configuration files; this does not hold planet data.\n'
   printf 'Disk planning: reserve space for the source PBF, roughly another source-sized set of chunks, import/index working data,\n'
   printf 'and the new index while an old one is still active. Exact planet usage is not measured; leave substantial extra headroom.\n'
@@ -227,24 +227,18 @@ else
 
   printf '\nStep 3/5: Served data and update settings\n'
   ask amenities 'Amenity values (lowercase, comma-separated, no spaces)' toilets
-  printf 'Shard precision divides the map into geographic cells; it is not a file-size setting. Approximate cell dimensions:\n'
-  printf '  3: 156 x 156 km; 4: 19.5 x 39 km; 5: 4.9 x 4.9 km; 6: 610 m x 1.2 km; 7: 153 x 153 m (at the equator).\n'
-  printf 'At Germany latitudes, east-west cells are about 60%% as wide. Each query loads the cells its bounding box touches.\n'
-  printf 'Higher precision means smaller cells and often less unrelated data per small query, but more cells/files to load;\n'
-  printf 'lower precision means fewer, larger cells and can read more unrelated nearby data. Large cells can exceed build limits.\n'
-  printf 'Example: precision 5 may touch only a few roughly 5 km cells for a neighborhood query; a country-wide query touches many.\n'
-  printf 'Higher precision can narrow small queries but creates more shards for large-area queries. Cell borders can add cells.\n'
-  printf 'Default 5 is a practical balance. Keep the same precision in the server and imported index.\n'
-  ask_int precision 'Geographic shard precision (3-7; default 5)' 5 3 7
-  ask_int cache_mb 'HTTP shard cache (MiB)' 256 1 1048576
+  printf 'Fresh imports use OAM-SQLITE-1: one database with a spatial index, without geographic shard files.\n'
+  printf 'Precision is retained only for configuration compatibility; it does not tune the SQLite index.\n'
+  ask_int precision 'Compatibility precision (3-7; keep default 5)' 5 3 7
+  ask_int cache_mb 'SQLite page cache per HTTP query connection (MiB)' 256 1 1048576
   printf 'Update interval: near the planet minute feed, small diffs are collected into one batch until this window ends.\n'
   printf 'With a small backlog the feed is checked every 5 minutes; when fully caught up, after the configured interval.\n'
   printf 'A backlog of at least one window of diffs starts immediately.\n'
-  printf 'For roughly two-hour updates, enter 7200 (about 120 minute diffs). Larger windows reduce generation writes but age the served data.\n'
+  printf 'For roughly two-hour updates, enter 7200 (about 120 minute diffs). Larger windows amortize transaction work but age the served data.\n'
   ask_int update_seconds 'Update batching window / maximum wait (seconds)' 3600 1 31536000
-  printf 'Published generations are snapshots for serving and rollback. Keep at least the active generation and one predecessor.\n'
-  printf 'Older generations are removed after a one-hour grace period; backups must be kept separately.\n'
-  ask_int generations_to_keep 'Published generations to retain (default 2)' 2 2 1000
+  printf 'Full baseline rebuilds create retained generations. Ordinary diffs update the active database in place.\n'
+  printf 'Keep at least the active baseline and one predecessor; old baselines are pruned after a one-hour grace period. Use backups for per-diff rollback.\n'
+  ask_int generations_to_keep 'Full baseline generations to retain (default 2)' 2 2 1000
   printf 'A full re-extract scans a new planet PBF and needs substantial disk, RAM and time. Routine replication updates work without it.\n'
   rebuild_enabled=false; confirm 'Enable scheduled full rebuilds? (downloads a newer planet PBF when due)' no && rebuild_enabled=true
   ask_int rebuild_seconds 'Full rebuild interval when enabled (seconds; 180 days = 15552000)' 15552000 1 315360000
@@ -263,7 +257,7 @@ else
   max_workers=$(((ram_mb - 512) / worker_mb))
   default_workers=3; (( max_workers >= 3 )) || default_workers=$max_workers
   ask_int workers 'Maximum extraction workers' "$default_workers" 1 "$max_workers"
-  printf 'Update workers run independent PBF lookups and geometry builds after each diff batch is coalesced.\n'
+  printf 'Update workers run concurrent baseline PBF lookup batches. SQLite writes and amenity geometry builds use one writer.\n'
   printf 'They are separate from extraction workers; more workers need additional RAM, CPU and disk throughput.\n'
   ask_int update_workers 'Concurrent update workers (1-16; default 1)' 1 1 16
   printf 'This controls temporary import data, not which values the server answers today. Yes keeps objects tagged with any amenity value\n'
@@ -284,7 +278,7 @@ else
   printf 'Proxy upstream: %s\nFallbacks: %s\nAmenities: %s; precision: %s\n' "$proxy_url" "${fallbacks:-none}" "$amenities" "$precision"
   printf 'Import: %s MiB RAM, %s workers x %s MiB; chunks %s MiB\n' "$ram_mb" "$workers" "$worker_mb" "$chunk_mb"
   printf 'Update workers: %s\n' "$update_workers"
-  printf 'Cache: %s MiB; update window: %s s; generations kept: %s; rebuild enabled: %s; interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$generations_to_keep" "$rebuild_enabled" "$rebuild_seconds" "$log_level"
+  printf 'SQLite cache per query: %s MiB; update window: %s s; generations kept: %s; rebuild enabled: %s; interval: %s s; logs: %s\n' "$cache_mb" "$update_seconds" "$generations_to_keep" "$rebuild_enabled" "$rebuild_seconds" "$log_level"
   printf 'Retain all values: %s; keep chunks: %s; verify counts: %s\n' "$all_values" "$keep_chunks" "$verify"
   if [[ $host_ip != 127.0.0.1 ]]; then
     printf 'The host binding is not loopback. Restrict access through your VPN/firewall/TLS proxy; Docker publishing can bypass UFW.\n'
@@ -313,6 +307,12 @@ services:
     build: '$repository'
     restart: unless-stopped
     stop_grace_period: 30s
+    healthcheck:
+      test: ['CMD', 'node', '--input-type=module', '-e', 'const r = await fetch("http://127.0.0.1:8081/api/status"); const s = await r.json(); if (!r.ok || s.localEngine?.storageFormat !== "OAM-SQLITE-1" || !(s.localEngine.replication?.sequenceNumber > 0)) process.exit(1);']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     env_file:
       - '$deployment/server.env'
     ports:
@@ -390,6 +390,9 @@ if confirm 'Build/rebuild the application image now? (skip only if already built
 source_path=$sources/$source_file
 active=false
 [[ ! -e $pipeline/data && ! -L $pipeline/data ]] || active=true
+if [[ $active == true && ! -f $pipeline/data/index.sqlite ]]; then
+  fail 'Active pipeline is not OAM-SQLITE-1. No migration is provided; configure a new pipeline and deployment directory for a fresh planet import. Existing data was left intact.'
+fi
 if [[ ! -f $source_path ]]; then
   [[ $active == false ]] || fail 'Active pipeline has lost its retained baseline. Restore the original bytes; do not download a new snapshot over that path.'
   [[ $source_mode == download ]] || fail "Retained source is missing: $source_path"
@@ -548,23 +551,8 @@ if [[ $has_import == true ]]; then
   [[ $import_exit == 0 ]] || fail "Import exited with code $import_exit. Resolve the logged error, then use --resume."
 fi
 
-printf '\nValidating the published generation against the server configuration...\n'
-dc run --rm --no-deps -T "$service" node --input-type=module -e '
-import { readFile } from "node:fs/promises";
-import assert from "node:assert/strict";
-import { loadConfig } from "./dist/config.js";
-const c = loadConfig();
-const m = JSON.parse(await readFile("/osm/data/manifest.json", "utf8"));
-const s = JSON.parse(await readFile("/osm/data/state.json", "utf8"));
-assert.ok(Array.isArray(m.shards) && m.shards.length > 0, "No populated shard inventory");
-assert.deepEqual([...m.amenities].sort(), [...c.amenities].sort(), "Amenity configuration mismatch");
-assert.equal(m.shardPrecision, c.shardPrecision, "Shard precision mismatch");
-assert.equal(s.replication?.baseUrl, c.updateBaseUrl, "Replication URL mismatch");
-assert.equal(s.replication?.kind, "planet");
-assert.equal(s.replication?.interval, "minute");
-assert.ok(Number.isSafeInteger(s.replication.sequenceNumber) && s.replication.sequenceNumber > 0);
-console.log(JSON.stringify({ generation: m.generation, timestamp: s.dataTimestamp, replication: s.replication }));
-'
+printf '\nValidating the published SQLite index, configuration, replication state and retained source...\n'
+dc run --rm --no-deps -T "$service" node scripts/check-index.mjs --integrity --require-elements
 confirm 'Start the HTTP server and its automatic updater now?' yes || { resume_hint; exit 0; }
 dc up -d "$service"
 ready=false
@@ -585,4 +573,4 @@ printf 'Check updater logs and timestamps before calling the planet current. A s
 printf 'Logs: %q logs --tail=100 -f %q\n' "$deployment/compose.sh" "$service"
 printf 'Status: %q ps\nStop: %q stop %q\nStart: %q up -d %q\n' \
   "$deployment/compose.sh" "$deployment/compose.sh" "$service" "$deployment/compose.sh" "$service"
-printf 'Retain all baseline PBFs. Old generations require operator-managed cleanup.\n'
+printf 'Retain matching baseline PBFs and backups. Old full baselines are pruned automatically; diff states are not retained as generations.\n'

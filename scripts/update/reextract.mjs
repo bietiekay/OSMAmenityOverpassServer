@@ -1,4 +1,6 @@
 import fs from 'node:fs/promises';
+import { readMetadata, writeState, hasDatabase } from '../database/metadata.mjs';
+import { IndexDatabase } from '../../dist/index/database.js';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -38,8 +40,7 @@ export function isReextractDue(state, now = Date.now(), intervalSeconds = 155520
 
 async function readActive(pipelineDir) {
   const root = await fs.realpath(path.join(pipelineDir, 'data'));
-  const state = JSON.parse(await fs.readFile(path.join(root, 'state.json'), 'utf8'));
-  const manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8'));
+  const {state,manifest} = await readMetadata(root);
   return { root, state, manifest };
 }
 
@@ -111,6 +112,10 @@ async function buildCandidate({ pipelineDir, sourcePbf, amenities, shardPrecisio
     await fs.rename(scratchRoot, destination);
     candidate.generationDir = destination;
     candidate.manifest.generation = path.basename(destination);
+    if (await hasDatabase(destination)) {
+      const index = new IndexDatabase(destination);
+      try { index.setMetadata('manifest', candidate.manifest); } finally { index.close(); }
+    }
     await writeJsonAtomic(path.join(destination, 'manifest.json'), candidate.manifest);
     return candidate;
   } finally {
@@ -142,7 +147,7 @@ export async function runReextract({
   const candidate = await buildCandidate({ pipelineDir, sourcePbf: path.resolve(source), amenities, shardPrecision, metadata, signal, extraction });
   const candidateDir = candidate.generationDir;
   try {
-    const candidateState = JSON.parse(await fs.readFile(path.join(candidateDir, 'state.json'), 'utf8'));
+    const {state:candidateState} = await readMetadata(candidateDir);
     const snapshotSequence = candidateState.replication?.sequenceNumber;
     if (!Number.isSafeInteger(snapshotSequence) || snapshotSequence <= 0) throw new Error('new PBF has no positive namespace-local replication sequence; refusing catch-up from zero');
     if (!namespaceMatches(candidateState.replication, replication)) throw new Error('new PBF replication metadata does not match the configured namespace');
@@ -201,7 +206,7 @@ export async function runReextract({
         }
       }
       if (signal?.aborted) throw signal.reason ?? new Error('re-extract aborted');
-      const updatedState = JSON.parse(await fs.readFile(path.join(candidateDir, 'state.json'), 'utf8'));
+      const {state:updatedState} = await readMetadata(candidateDir);
       if (updatedState.replication.sequenceNumber < activeSequence || updatedState.replication.sequenceNumber < snapshotSequence) {
         throw new Error('candidate cursor would regress the active generation');
       }
@@ -210,7 +215,7 @@ export async function runReextract({
         ? updatedState.replication.sequenceNumber
         : 0;
       updatedState.lastReextractAt = now();
-      await writeJsonAtomic(path.join(candidateDir, 'state.json'), updatedState);
+      await writeState(candidateDir, updatedState);
       await activateGeneration(pipelineDir, candidateDir, {
         lockHeld: true,
         beforeActivate: ({ activeRoot, state }) => {

@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { readMetadata } from './database/metadata.mjs';
 import path from 'node:path';
 import { createReadStream } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -25,7 +26,7 @@ export async function attestSourcePbf(pipelineDir, sourcePbf, onProgress = () =>
   if (!sourcePbf) return null;
   const source = path.resolve(sourcePbf);
   const active = await fs.realpath(path.join(pipelineDir, 'data'));
-  const state = JSON.parse(await fs.readFile(path.join(active, 'state.json'), 'utf8'));
+  const {state} = await readMetadata(active);
   const expectedFingerprint = state.sourceFingerprint;
   if (!expectedFingerprint) throw new Error('active generation has no source fingerprint for validating OSM_AMENITY_SOURCE_PBF');
   const stat = await fs.stat(source, { bigint: true });
@@ -60,7 +61,7 @@ export async function attestSourcePbf(pipelineDir, sourcePbf, onProgress = () =>
 
 async function readState(pipelineDir) {
   const active = await fs.realpath(path.join(pipelineDir, 'data'));
-  return { active, state: JSON.parse(await fs.readFile(path.join(active, 'state.json'), 'utf8')) };
+  return { active, state: (await readMetadata(active)).state };
 }
 
 async function resolveStateSource(pipelineDir, configuredSource, state, onProgress) {
@@ -187,7 +188,7 @@ export function createUpdateWorker({
         }
       });
       publishedSequence = latest.sequenceNumber;
-      onLog(`applied ${replication.kind}/${replication.interval} sequences ${cursor + 1}-${latest.sequenceNumber}: ${result.changedCount} changed objects, ${result.cells.length} cells`);
+      onLog(`applied ${replication.kind}/${replication.interval} sequences ${cursor + 1}-${latest.sequenceNumber}: ${result.changedCount} changed objects, ${result.affectedObjects === undefined ? `${result.cells.length} cells` : `${result.affectedObjects} affected amenities`}`);
       let remainingGap = null;
       try {
         const currentFeed = await fetchState(replication, fetchImpl, { signal });

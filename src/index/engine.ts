@@ -4,6 +4,8 @@
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { IndexDatabase, DATABASE_FILE, objectKey } from './database.js';
 
 import type { ParsedAmenityQuery, OutClause } from '../query.js';
 import type { BoundingBox } from './geohash.js';
@@ -220,6 +222,7 @@ export class AmenityEngine {
 
   /** Number of shard files currently on disk (cheap enough for /api/status). */
   public async countShards(): Promise<number> {
+    if (existsSync(path.join(this.options.dataDir, DATABASE_FILE))) return 0;
     try {
       const names = await fs.readdir(path.join(this.options.dataDir, 'shards'));
       return names.filter((name) => name.endsWith('.bin')).length;
@@ -229,6 +232,10 @@ export class AmenityEngine {
   }
 
   public async countElements(): Promise<number> {
+    if (existsSync(path.join(this.options.dataDir, DATABASE_FILE))) {
+      const index = new IndexDatabase(this.options.dataDir, { readOnly: true });
+      try { return index.counts().mainUnique; } finally { index.close(); }
+    }
     try {
       const manifestRaw = await fs.readFile(
         path.join(this.options.dataDir, 'manifest.json'), 'utf8'
@@ -253,9 +260,31 @@ export class AmenityEngine {
   public async query(query: ParsedAmenityQuery): Promise<QueryResult> {
     // Pin a symlinked generation once per request so a publish cannot mix shards.
     const dataRoot = await fs.realpath(this.options.dataDir);
-    const generation = await this.readGeneration(dataRoot);
+    // Copy all response data inside one synchronous read transaction. No query
+    // can mix metadata or geometry from different diff commits.
+    let databaseRows: ShardElement[] | undefined;
+    let databaseGeneration: { timestamp?: string; configHash?: string } | undefined;
+    if (existsSync(path.join(dataRoot, DATABASE_FILE))) {
+      const index = new IndexDatabase(dataRoot, { readOnly: true, cacheMb: this.options.cacheMb });
+      try {
+        index.db.exec('BEGIN');
+        const manifest = index.getMetadata<{ configHash: string }>('manifest');
+        const state = index.getMetadata<{ dataTimestamp?: string }>('state');
+        if (!manifest || !state) throw new Error('index generation is not ready: database metadata missing');
+        if (this.expectedConfigHash && manifest.configHash !== this.expectedConfigHash) throw new Error('generation manifest config hash mismatch');
+        const main = index.query(query.bbox, query.amenity);
+        const rows = new Map(main.map((element) => [objectKey(element), element]));
+        for (const element of main) for (const helper of index.related(objectKey(element))) {
+          if (!rows.has(objectKey(helper))) rows.set(objectKey(helper), helper);
+        }
+        databaseRows = [...rows.values()];
+        databaseGeneration = { timestamp: state.dataTimestamp, configHash: manifest.configHash };
+        index.db.exec('COMMIT');
+      } finally { index.close(); }
+    }
+    const generation: { timestamp?: string; configHash?: string; declaredShards?: Set<string> } = databaseGeneration ?? await this.readGeneration(dataRoot);
     const stamp = generation.timestamp ?? this.configuredTimestamp();
-    const cells = bboxToCells(query.bbox, this.options.shardPrecision);
+    const cells = databaseRows ? ['database'] : bboxToCells(query.bbox, this.options.shardPrecision);
     if (cells.length === 0) {
       return this.emptyResult(query.output, stamp);
     }
@@ -269,19 +298,16 @@ export class AmenityEngine {
       query.clauses[0] ?? { form: 'default', meta: false, quiet: false };
 
     for (const cell of cells) {
-      const buffer = await this.loadShard(cell, dataRoot, generation.declaredShards);
-      if (!buffer) {
-        continue;
-      }
-      let shard;
-      try {
-        shard = readShard(buffer);
-      } catch (error) {
-        throw new Error(`shard ${cell} is corrupt: ${String(error)}`, { cause: error });
-      }
-      if ((this.expectedConfigHash && shard.header.configHash !== this.expectedConfigHash) ||
-        (generation.configHash && shard.header.configHash !== generation.configHash)) {
-        throw new Error(`shard ${cell} config hash mismatch`);
+      let shard: { elements: ShardElement[] };
+      if (databaseRows) {
+        shard = { elements: databaseRows };
+      } else {
+        const buffer = await this.loadShard(cell, dataRoot, generation.declaredShards);
+        if (!buffer) continue;
+        const decoded = readShard(buffer);
+        if ((this.expectedConfigHash && decoded.header.configHash !== this.expectedConfigHash) ||
+            (generation.configHash && decoded.header.configHash !== generation.configHash)) throw new Error(`shard ${cell} config hash mismatch`);
+        shard = decoded;
       }
       for (const element of shard.elements) {
         const identity = `${element.type}:${element.id}`;

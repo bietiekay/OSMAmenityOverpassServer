@@ -17,6 +17,8 @@
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { IndexDatabase, DATABASE_FILE } from './index/database.js';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import formbody from '@fastify/formbody';
 
@@ -45,7 +47,11 @@ export interface DataState {
 export const readDataState = async (dataDir: string): Promise<DataState> => {
   const fallback: DataState = { lastSeq: null, lastUpdate: null, dataTimestamp: null, replication: null };
   try {
-    const raw = await fs.readFile(path.join(dataDir, 'state.json'), 'utf8');
+    let raw: string;
+    if (existsSync(path.join(dataDir, DATABASE_FILE))) {
+      const index = new IndexDatabase(dataDir, { readOnly: true });
+      try { raw = JSON.stringify(index.getMetadata('state')); } finally { index.close(); }
+    } else raw = await fs.readFile(path.join(dataDir, 'state.json'), 'utf8');
     const parsed = JSON.parse(raw) as {
       lastSeq?: number;
       lastUpdate?: string;
@@ -155,6 +161,7 @@ export const buildServer = (deps: ServerDeps): Promise<FastifyInstance> => {
 
     // localEngine extension: operational detail for monitoring this server.
     const localEngine = {
+      storageFormat: existsSync(path.join(config.dataDir, DATABASE_FILE)) ? 'OAM-SQLITE-1' : 'OAM1',
       shards: shardCount,
       elements: elementCount,
       amenities: config.amenities,

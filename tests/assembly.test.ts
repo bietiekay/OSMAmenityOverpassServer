@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildIndex } from '../scripts/extract/assembly.mjs';
 import { encodeElement } from '../scripts/extract/lines.mjs';
-import { readShard } from '../src/index/shard.js';
+import { writeState } from '../scripts/database/metadata.mjs';
+import { databaseElements } from './database-helpers.js';
 
 describe('Stage 4 disk-backed assembly', () => {
   it('builds and activates a validated generation with main and support objects', async () => {
@@ -31,11 +32,10 @@ describe('Stage 4 disk-backed assembly', () => {
     try {
       const manifest = await buildIndex({ pipelineDir: root, source: 'fixture.pbf', amenities: ['toilets'], shardPrecision: 5, sourceTimestamp: '2026-01-01T00:00:00Z' });
       expect(manifest.counts.mainUnique).toBe(4);
-      expect(manifest.shardCount).toBeGreaterThan(0);
+      expect(manifest.format).toBe('OAM-SQLITE-1');
       const active = path.join(root, 'data');
       expect((await fs.lstat(active)).isSymbolicLink()).toBe(true);
-      const shards = await Promise.all((await fs.readdir(path.join(active, 'shards'))).filter((name) => name.endsWith('.bin')).map(async (name) => readShard(await fs.readFile(path.join(active, 'shards', name)))));
-      const elements = shards.flatMap((s) => s.elements);
+      const elements = databaseElements(active);
       expect(elements.some((e) => e.type === 'relation' && e.id === 30)).toBe(true);
       expect(elements.some((e) => e.type === 'way' && e.id === 20)).toBe(true);
       expect(elements.some((e) => e.type === 'node' && e.id === 20)).toBe(true);
@@ -57,7 +57,7 @@ describe('Stage 4 disk-backed assembly', () => {
       expect(await fs.readlink(active)).toBe(activeLink);
       const reindexed = await buildIndex({ pipelineDir: root, source: 'fixture.pbf', amenities: ['drinking_water'], shardPrecision: 5, sourceTimestamp: '2026-01-01T00:00:00Z' });
       expect(reindexed.counts.mainUnique).toBe(0);
-      expect(await fs.readdir(path.join(active, 'shards'))).toEqual([]);
+      expect(databaseElements(active)).toEqual([]);
       await expect(fs.stat(oldGeneration)).resolves.toBeDefined();
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
@@ -115,7 +115,7 @@ describe('Stage 4 disk-backed assembly', () => {
       expect(state).toMatchObject({ lastSeq: 0, replication: { sequenceNumber: 4939, kind: 'regional', interval: 'day' } });
       state.replication.sequenceNumber = 4940;
       state.dataTimestamp = '2026-10-15T00:00:00.000Z';
-      await fs.writeFile(statePath, `${JSON.stringify(state)}\n`);
+      await writeState(active, state);
       const activeLink = await fs.readlink(path.join(root, 'data'));
       await expect(buildIndex({ pipelineDir: root, amenities: ['drinking_water'], shardPrecision: 5, sourceTimestamp: '2026-10-15T00:00:00Z', replication: { baseUrl: 'https://download.geofabrik.de/asia/japan-updates', kind: 'regional', interval: 'day', sequenceNumber: 4939 } })).rejects.toThrow(/older than active sequence/);
       expect(await fs.readlink(path.join(root, 'data'))).toBe(activeLink);

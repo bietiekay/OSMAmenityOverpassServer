@@ -1,7 +1,7 @@
 {
   "name": "osm-amenity-overpass-server",
   "version": "0.1.1",
-  "description": "Standalone, self-updating, Overpass-compatible amenity data server with a geohash-sharded on-disk index (worldwide OSM planet).",
+  "description": "Standalone, self-updating, Overpass-compatible amenity data server with a transactional SQLite spatial index (worldwide OSM planet).",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ci": "vitest run --coverage",
+    "check-index": "node scripts/check-index.mjs",
     "extract": "node scripts/extract.mjs",
     "make-fixture": "node scripts/make-fixture.mjs",
     "parity": "node scripts/parity.mjs",

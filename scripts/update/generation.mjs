@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { IndexDatabase, DATABASE_FORMAT } from '../../dist/index/database.js';
+import { readMetadata } from '../database/metadata.mjs';
 import { readShard } from '../../dist/index/shard.js';
 
 async function syncDirectory(directory) {
@@ -93,8 +95,11 @@ export async function activateGeneration(dataDir, generationDir, { lockHeld = fa
     const candidate = await fs.realpath(generationDir);
     const generations = await fs.realpath(path.join(dataDir, 'data-generations'));
     if (!candidate.startsWith(`${generations}${path.sep}`)) throw new Error('candidate generation must be inside data-generations');
-    const manifest = JSON.parse(await fs.readFile(path.join(candidate, 'manifest.json'), 'utf8'));
-    const state = JSON.parse(await fs.readFile(path.join(candidate, 'state.json'), 'utf8'));
+    const {manifest,state} = await readMetadata(candidate);
+    if (manifest.format === DATABASE_FORMAT) {
+      const index = new IndexDatabase(candidate);
+      try { index.validate(); index.db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } finally { index.close(); }
+    }
     if (!Array.isArray(manifest.shards)) throw new Error('candidate manifest has no declared shard list');
     for (const value of manifest.shards) {
       const cell = String(value).replace(/\.bin$/, '');

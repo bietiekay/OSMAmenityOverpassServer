@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { readMetadata } from '../database/metadata.mjs';
 import path from 'node:path';
 import { withGenerationLock } from './generation.mjs';
 
@@ -53,14 +54,13 @@ async function prunePublishedGenerations(pipelineDir, activeRoot, keepCount, onP
   for (const entry of await entries(generationRoot)) {
     if (!entry.isDirectory()) continue;
     const update = /^update-(\d+)-[0-9a-f-]+$/.exec(entry.name);
-    const build = /^build-[0-9a-f]{64}-[0-9a-f-]+$/.test(entry.name);
+    const build = /^build-(?:sqlite-)?[0-9a-f]{64}-[0-9a-f-]+$/.test(entry.name);
     const reextract = /^reextract-[0-9a-f-]+$/.test(entry.name);
     if (!update && !build && !reextract) continue;
     const target = path.join(generationRoot, entry.name);
     const stat = await fs.lstat(target);
     if (!stat.isDirectory()) continue;
-    const state = await fs.readFile(path.join(target, 'state.json'), 'utf8').then(JSON.parse).catch(() => null);
-    const manifest = await fs.readFile(path.join(target, 'manifest.json'), 'utf8').then(JSON.parse).catch(() => null);
+    const {state,manifest} = await readMetadata(target).catch(() => ({state:null,manifest:null}));
     if (!Number.isSafeInteger(state?.replication?.sequenceNumber) || !Array.isArray(manifest?.shards)) continue;
     // A re-extract is moved into data-generations before activation. Its
     // completion marker distinguishes a published generation from that work.
@@ -97,7 +97,7 @@ export async function cleanupOrphanedUpdateData(pipelineDir, { olderThanMs, publ
   }
   return withGenerationLock(pipelineDir, async () => {
     const activeRoot = await fs.realpath(path.join(pipelineDir, 'data'));
-    const activeState = JSON.parse(await fs.readFile(path.join(activeRoot, 'state.json'), 'utf8'));
+    const {state:activeState} = await readMetadata(activeRoot);
     if (!Number.isSafeInteger(activeState.replication?.sequenceNumber) || activeState.replication.sequenceNumber < publishedSequence) {
       throw new Error('active generation has not published the cleanup sequence');
     }

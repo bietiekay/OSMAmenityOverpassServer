@@ -46,41 +46,25 @@ optional original minute provenance. Unknown cursor data is not guessed.
 
 ## 3. Generation layout and consistency
 
-Pipeline root layout:
+Fresh imports create `data-generations/<id>/index.sqlite` in OAM-SQLITE-1 format
+and publish it through the `data` symlink. Metadata inside SQLite is authoritative;
+`manifest.json` and `state.json` are diagnostic sidecars. The engine pins the
+baseline directory and reads query data and metadata in one SQLite transaction.
+Ordinary updates commit into that database in place. Full rebuilds create and
+activate a separate baseline. No migration is provided.
 
-```text
-<root>/work/                 resumable stage intermediates
-<root>/data -> data-generations/<id>  active immutable generation
-<root>/data-generations/<id>/manifest.json
-<root>/data-generations/<id>/state.json
-<root>/data-generations/<id>/shards/<geohash>.bin
-```
+## 4. OAM-SQLITE-1
 
-The engine resolves the active directory once per query, then reads generation
-metadata and shard files from that pinned real path. `manifest.shards` is the
-authoritative shard inventory: undeclared stale files are ignored, while a
-missing declared shard fails the query. Manifest configuration hash must match
-the engine's `{ amenities, precision }` hash. `manifest.shards: []` is a valid
-empty generation; missing metadata is not a ready index.
+`raw_objects` stores current typed OSM identities and tombstones; `geometry`
+stores deduplicated main and helper objects; `spatial` is an RTree of main
+bounds. `dependencies` and `helpers` track exact main-object dependencies and
+output members. `baseline_versions` records validated source versions.
+Trigger-maintained counters and replication metadata commit with data changes.
+The configuration hash retains amenities and the compatibility precision value.
+Full details are in [SQLite storage](docs/SQLITE-STORAGE.md).
 
-## 4. OAM1 binary shards
-
-OAM1 keeps its magic and 78-byte header. Current writer format version 2 uses a
-type-qualified `(type,id)` sorted index, preventing node/way/relation ID
-collisions. The reader supports v1 indexes for compatibility. In v2 way member
-coordinates encode missing values with paired `INT32_MIN` sentinels, so a real
-coordinate `(0,0)` round-trips. The v1 representation used zero/zero for
-missing coordinates, so the ambiguity for a v1 way at `(0,0)` cannot be
-recovered. Current v2 CRC verification protects the header except its checksum
-field and the data/index payload. Legacy v1 and early v2 payload-only checksums
-remain readable. The configuration
-hash includes effective amenities and shard precision.
-
-Nodes are stored in their point shard; ways/relations are stored in the cells
-selected by stage 4. Ways retain node IDs and inline coordinates for geometry
-and member output. Relation member records retain type, ref, and role; helper
-records are stored where available. Data with unavailable source metadata does
-not receive invented metadata.
+The legacy OAM1 reader remains compatible with its v1/v2 binary formats; fresh
+imports do not produce those files. Missing source metadata is never fabricated.
 
 ## 5. Pipeline and replication
 
@@ -107,22 +91,17 @@ timestamp on the candidate PBF, builds without publishing, catches up in the
 same namespace to the latest feed or active cursor under the generation lock,
 and activates once. Failure leaves the serving generation active. The first
 scheduled check establishes its timer baseline; later checks use
-`OSM_AMENITY_REEXTRACT_EVERY_SECONDS` (default 604800). Source selection is
-`OSM_AMENITY_REEXTRACT_SOURCE_PBF`, falling back to
-`OSM_AMENITY_SOURCE_PBF`, then the active generation's recorded PBF path. The
+`OSM_AMENITY_REEXTRACT_EVERY_SECONDS` (default 15552000, opt-in through `OSM_AMENITY_REEXTRACT_ENABLED`). Source selection is `OSM_AMENITY_REEXTRACT_SOURCE_PBF`, otherwise a newly
+downloaded current planet PBF. The
 update watch loop checks this schedule after each
 replication catch-up cycle. Candidate catch-up holds the generation lock while
 downloading and applying its remaining diffs, so long gaps delay other updates;
 the active generation continues serving queries during this work.
 
-The implementation currently clones the full generation using hardlinks and
-scans all declared shards for validation and exact unique counts per batch.
-Before activation it fsyncs the files and nested directories. Only changed shard
-contents are rewritten, but metadata work and verification remain proportional
-to the whole generation. Update dependency closure is limited to 50,000 tracked
-objects, 5,000 cells and 64 MiB of estimated rebuilt rows; source resolution has
-a separate 64 MiB per-invocation resolved-object limit and adaptively splits
-candidate-block batches. The shared geometry member cache has no aggregate
-byte cap; this remains a production memory-limit follow-up. Failure
-preserves the previous generation and cursor. Old generations are retained;
-automatic garbage collection is not implemented.
+SQLite diffs use a single writer transaction with consistent concurrent WAL
+readers. The update path does not clone the baseline or scan the complete spatial
+index. Any failure before commit preserves data and cursor. Geometry builds
+limit dependency count to 50,000, estimated raw cache to 64 MiB and relation depth
+to 16; a batch may affect at most 50,000 amenities. See the storage guide for
+source lookup, checkpoint and backup requirements. Retention applies to full
+baseline generations; individual diff rollback snapshots are not created.

@@ -17,9 +17,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
 COPY scripts ./scripts
 
-# The active generation is /osm/data; updater staging and immutable generations
-# are siblings under the same writable pipeline root (/osm).
+# The active SQLite database is /osm/data/index.sqlite. Full rebuild baselines
+# and update work are siblings under the same writable pipeline root (/osm).
 VOLUME ["/osm"]
 ENV OSM_AMENITY_DATA_DIR=/osm/data
 EXPOSE 8081
-CMD ["node", "dist/index.js"]
+CMD ["sh", "scripts/start-server.sh"]
