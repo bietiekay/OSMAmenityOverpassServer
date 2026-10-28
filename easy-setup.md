@@ -74,7 +74,11 @@ The three paths have different jobs:
   may retain old generations during rebuilds. The chunk set is roughly another
   source-sized copy; intermediate files and the index add more, and enabled
   rebuilds can temporarily need space alongside the current generation and
-  another downloaded planet PBF.
+  another downloaded planet PBF. The wizard also creates `pipeline/tmp/` and
+  bind-mounts it to `/var/tmp` in the service. It sets both `TMPDIR` and
+  `SQLITE_TMPDIR` to `/var/tmp`, so Node and SQLite temporary files stay on the
+  filesystem selected for the pipeline instead of consuming the Docker overlay
+  filesystem. Keep this directory on the same storage volume as the pipeline.
 - **Deployment directory** holds Compose and environment configuration and is
   small compared with the other two.
 
@@ -97,7 +101,9 @@ Overpass queries to. It chooses a backend and forwards the query. This setup
 adds the Amenity Server as one backend; it does not install or replace the
 proxy. The Amenity Server handles the supported amenity queries (such as
 `amenity=toilets`). For unsupported query types it responds with HTTP 501, so
-the proxy should have another Overpass upstream available as a fallback.
+add another Overpass upstream only if those unsupported query types should be
+answered by a different service. The wizard leaves that routing decision to the
+operator.
 
 The wizard asks where that existing proxy runs so it can show the correct
 backend URL: a shared Docker network for a proxy container on the same host, a

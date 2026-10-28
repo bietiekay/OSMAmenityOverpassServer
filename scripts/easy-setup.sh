@@ -284,7 +284,7 @@ else
     printf 'The host binding is not loopback. Restrict access through your VPN/firewall/TLS proxy; Docker publishing can bypass UFW.\n'
   fi
   confirm 'Write this deployment configuration?' yes || exit 0
-  install -d -- "$deployment" "$pipeline" "$sources"
+  install -d -- "$deployment" "$pipeline" "$pipeline/tmp" "$sources"
   for key in "${keys[@]}"; do printf '%s\t%s\n' "$key" "${!key}"; done > "$deployment/settings.tsv"
   cat > "$deployment/server.env" <<ENV
 PORT=8081
@@ -307,6 +307,9 @@ services:
     build: '$repository'
     restart: unless-stopped
     stop_grace_period: 30s
+    environment:
+      TMPDIR: /var/tmp
+      SQLITE_TMPDIR: /var/tmp
     healthcheck:
       test: ['CMD', 'node', '--input-type=module', '-e', 'const r = await fetch("http://127.0.0.1:8081/api/status"); const s = await r.json(); if (!r.ok || s.localEngine?.storageFormat !== "OAM-SQLITE-1" || !(s.localEngine.replication?.sequenceNumber > 0)) process.exit(1);']
       interval: 30s
@@ -319,12 +322,13 @@ services:
       - '$host_ip:$host_port:8081'
     volumes:
       - '$pipeline:/osm:rw'
+      - '$pipeline/tmp:/var/tmp:rw'
       - '$sources:/source:ro'
     logging:
       driver: json-file
       options:
         max-size: '10m'
-        max-file: '5'
+        max-file: '3'
     networks:
       default: {}
       $network:
@@ -348,6 +352,9 @@ YAML
     fi
   } > "$deployment/proxy.compose.example.yml"
 fi
+
+# Keep native SQLite and Node temporary files on the pipeline filesystem (SSD).
+install -d -m 0700 -- "$pipeline/tmp"
 
 # All future commands use the saved, explicit project/file rather than the CWD.
 dc() { "$deployment/compose.sh" "$@"; }
